@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hide 'n' Seek</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Basic styles for view containers and pulsing */
+        .view { display: none; } /* Hide views by default */
+        .view.active { display: flex; /* Use flex for most views to center content */ }
+        .pulse { animation: pulse 1.5s infinite; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        /* Ensure overlay covers everything */
+        #audio-enable-overlay { z-index: 50; }
+         #howToPlayModal { z-index: 40; } /* Ensure modal is above other views but below audio overlay */
+
+         /* Style for number input arrows (optional, for better appearance) */
+        input[type=number]::-webkit-inner-spin-button,
+        input[type=number]::-webkit-outer-spin-button {
+          -webkit-appearance: none;
+          margin: 0;
+        }
+        input[type=number] {
+          -moz-appearance: textfield; /* Firefox */
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white flex items-center justify-center min-h-screen font-sans">
+
+    <div id="audio-enable-overlay" class="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center cursor-pointer text-center p-4 active view">
+        <h1 class="text-2xl md:text-4xl font-bold">Tap Screen to Start Game<br>(Required by browser for audio)</h1>
+    </div>
+
+    <div id="howToPlayModal" class="fixed inset-0 bg-gray-800 bg-opacity-95 p-6 md:p-10 flex-col items-center justify-center text-left overflow-y-auto view">
+          <h2 class="text-3xl font-bold mb-6 text-center">How to Play</h2>
+          <div class="max-w-2xl w-full space-y-4 bg-gray-700 p-6 rounded-lg shadow-lg text-lg">
+              <p>Welcome to Phone Hide 'n' Seek!</p>
+              <ul class="list-disc list-inside space-y-2 ml-4">
+                  <li>One player (the <strong class="text-red-400">Hider</strong>) creates a room and gets all the phones together.</li>
+                  <li>Other players (the <strong class="text-blue-400">Seekers</strong>) join using the room code, then leave the room.</li>
+                  <li>The Hider hides all the phones (including their own).</li>
+                  <li>Once all phones are hidden and confirmed via their screens, the Seekers come back in.</li>
+                  <li>The <strong class="text-red-500">Seeking Phase</strong> begins! Seekers have a time limit to find the phones.</li>
+                  <li>Each hidden phone will periodically play its own unique sound to help the Seekers find it.</li>
+                  <li>When a phone is found, press the <strong class="text-green-500">"Mark Phone as Found"</strong> button on its screen.</li>
+                  <li><strong class="text-green-400">Seekers Win</strong> if all phones are found before time runs out!</li>
+                  <li><strong class="text-red-400">Hider Wins</strong> if time runs out first! (Unfound phones will then play sounds one-by-one until marked found).</li>
+              </ul>
+          </div>
+          <button id="closeHowToPlayBtn" class="mt-8 bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-6 rounded shadow-md transition duration-150 ease-in-out">
+              Close
+          </button>
+      </div>
+
+
+    <div id="join-view" class="view flex-col items-center justify-center p-6 space-y-4 w-full max-w-sm">
+        <h1 class="text-4xl font-bold mb-6 text-teal-400">Hide 'n' Seek</h1>
+        <input type="text" id="roomCodeInput" placeholder="Enter 5-Character Room Code" maxlength="5" class="p-3 bg-gray-700 border border-gray-600 rounded text-white uppercase tracking-widest text-center w-full shadow-md focus:outline-none focus:ring-2 focus:ring-teal-500">
+        <button id="joinRoomBtn" class="w-full bg-teal-600 hover:bg-teal-700 text-white font-bold py-3 px-4 rounded shadow-md transition duration-150 ease-in-out">Join Room</button>
+        <div class="text-gray-400 text-lg">OR</div>
+        <button id="createRoomBtn" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-4 rounded shadow-md transition duration-150 ease-in-out">Create New Room</button>
+        <button id="howToPlayBtn" class="mt-4 bg-black text-white px-4 py-1 rounded shadow-md hover:bg-gray-700 transition duration-150 ease-in-out">How to Play?</button>
+        <p id="join-error" class="text-red-500 mt-4 h-6"></p>
+    </div>
+
+    <div id="waiting-room-view" class="view flex-col items-center justify-center p-6 space-y-4 w-full max-w-md">
+        <h1 class="text-3xl font-bold mb-4 text-teal-400">Waiting Room</h1>
+        <p class="text-xl">Room Code: <span id="roomCodeDisplay" class="font-mono bg-gray-700 px-2 py-1 rounded text-yellow-400 tracking-widest"></span></p>
+        <p class="text-gray-400 text-sm">(Share this code with friends)</p>
+
+        <div class="w-full bg-gray-800 p-4 rounded-lg shadow-md">
+            <h2 class="text-xl font-semibold mb-3 text-center">Phones Connected</h2>
+            <ul id="playerList" class="space-y-2 text-center">
+                </ul>
+        </div>
+
+        <p class="text-sm text-yellow-300 mt-4 text-center px-2">
+            <strong class="font-bold">Important:</strong> Please set all phones to the <strong class="font-bold">same volume level</strong>.
+            <br>For iPhones, ensure the side switch is <strong class="font-bold">NOT</strong> set to silent mode.
+        </p>
+
+        <div id="hider-controls" class="hidden w-full bg-gray-800 p-4 rounded-lg shadow-md space-y-3 mt-4">
+             <h2 class="text-xl font-semibold mb-2 text-center text-indigo-300">Hider Controls</h2>
+            <div class="flex items-center justify-center space-x-2">
+                <label for="seekTimeLimit" class="text-gray-300">Seek Time Limit (s):</label>
+                <input type="number" id="seekTimeLimit" value="120" min="15" max="600" class="p-1 w-20 bg-gray-700 border border-gray-600 rounded text-white text-center focus:outline-none focus:ring-1 focus:ring-indigo-500">
+            </div>
+             <button id="configureGameBtn" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded shadow-md transition duration-150 ease-in-out text-sm">Update Time Limit</button>
+             <button id="startHidingBtn" class="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded shadow-md transition duration-150 ease-in-out disabled:opacity-50 disabled:cursor-not-allowed" disabled>Start Hiding Phase</button>
+             <p id="start-error" class="text-red-500 mt-2 h-5 text-center text-sm"></p>
+        </div>
+    </div>
+
+    <div id="hiding-view" class="view flex-col items-center justify-center p-6 space-y-6 text-center w-full max-w-md">
+        <h1 class="text-4xl font-bold text-yellow-400 pulse">Hiding Phase!</h1>
+        <p id="hiding-instructions" class="text-xl">Send the Seekers outside of the room and hide this phone now! Press the button below when it's hidden.</p>
+        <p id="hiding-status" class="text-lg text-gray-400">(0/X phones confirmed hidden)</p>
+        <button id="confirmHiddenBtn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded shadow-md transition duration-150 ease-in-out text-lg">Confirm Phone as Hidden</button>
+        <p id="hiding-confirmed-text" class="hidden text-xl text-green-400">This phone is hidden!</p>
+         <div class="mt-4">
+             <p class="text-gray-400">Seeking starts in:</p>
+             <p id="hiding-countdown" class="text-6xl font-mono text-red-500">-</p>
+         </div>
+    </div>
+
+    <div id="seeking-view" class="view flex-col items-center justify-center p-6 space-y-4 w-full max-w-md">
+        <h1 class="text-4xl font-bold text-red-500">Seeking Phase!</h1>
+        <p class="text-2xl font-mono">Time Remaining: <span id="timerDisplay" class="text-yellow-400">00:00</span></p>
+
+        <div class="w-full bg-gray-800 p-4 rounded-lg shadow-md">
+            <h2 class="text-xl font-semibold mb-3 text-center">Phone Status</h2>
+            <ul id="hiderStatusList" class="space-y-1 text-center">
+                </ul>
+        </div>
+
+         <div id="hidden-device-ui" class="text-center space-y-3">
+             <button id="markSelfFoundBtn" class="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded shadow-md transition duration-150 ease-in-out text-lg">Mark Phone as Found</button>
+         </div>
+
+         <p id="alreadyFoundText" class="hidden text-xl text-green-400 font-semibold">✅ Phone Found!</p>
+
+    </div>
+
+    <div id="game-over-view" class="view flex-col items-center justify-center p-6 space-y-4 text-center w-full max-w-md">
+        <h1 class="text-4xl font-bold mb-2">Game Over!</h1>
+        <p id="gameResult" class="text-3xl font-semibold"></p>
+        <p id="gameOverReason" class="text-lg text-gray-400 mb-4"></p>
+
+        <div class="w-full bg-gray-800 p-4 rounded-lg shadow-md mb-4">
+            <h2 class="text-xl font-semibold mb-3 text-center">Final Status</h2>
+            <ul id="finalPlayerList" class="space-y-1 text-center">
+                </ul>
+        </div>
+
+        <div id="hider-win-reveal-section" class="hidden w-full text-center space-y-3 mt-4 p-4 bg-gray-700 rounded-lg">
+             <p id="hider-win-status" class="text-xl text-yellow-300"></p>
+             <button id="markFoundGameOverBtn" class="hidden bg-yellow-600 hover:bg-yellow-700 text-black font-bold py-3 px-6 rounded shadow-md transition duration-150 ease-in-out text-lg">Mark Phone as Found</button>
+             <p id="gameOverFoundText" class="hidden text-xl text-green-400 font-semibold">✅ Phone found during reveal!</p>
+        </div>
+
+        <button id="playAgainBtn" class="mt-6 bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-6 rounded shadow-md transition duration-150 ease-in-out text-lg">Play Again</button>
+    </div>
+
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.7.77/Tone.js"></script>
+    <script src="client.js"></script>
+</body>
+</html>
