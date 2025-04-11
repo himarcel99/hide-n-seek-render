@@ -1,759 +1,929 @@
-// Establish Socket.IO connection
-const socket = io();
-
-// === DOM Elements ===
-const views = document.querySelectorAll('.view');
-const audioEnableOverlay = document.getElementById('audio-enable-overlay');
-const howToPlayModal = document.getElementById('howToPlayModal');
-const closeHowToPlayBtn = document.getElementById('closeHowToPlayBtn');
-const howToPlayBtn = document.getElementById('howToPlayBtn');
-
-// Join View
-const joinView = document.getElementById('join-view');
-const roomCodeInput = document.getElementById('roomCodeInput');
-const joinRoomBtn = document.getElementById('joinRoomBtn');
-const createRoomBtn = document.getElementById('createRoomBtn');
-const joinError = document.getElementById('join-error');
-
-// Waiting Room View
-const waitingRoomView = document.getElementById('waiting-room-view');
-const roomCodeDisplay = document.getElementById('roomCodeDisplay');
-const playerList = document.getElementById('playerList');
-const hiderControls = document.getElementById('hider-controls'); // Div containing Hider buttons
-const seekTimeLimitInput = document.getElementById('seekTimeLimit');
-const configureGameBtn = document.getElementById('configureGameBtn');
-const startHidingBtn = document.getElementById('startHidingBtn'); // The button itself
-const startError = document.getElementById('start-error');
-
-// Hiding Phase View
-const hidingView = document.getElementById('hiding-view');
-const hidingInstructions = document.getElementById('hiding-instructions');
-const hidingStatus = document.getElementById('hiding-status');
-const confirmHiddenBtn = document.getElementById('confirmHiddenBtn');
-const hidingConfirmedText = document.getElementById('hiding-confirmed-text');
-const hidingCountdown = document.getElementById('hiding-countdown');
-
-// Seeking Phase View
-const seekingView = document.getElementById('seeking-view');
-const timerDisplay = document.getElementById('timerDisplay');
-const hiderStatusList = document.getElementById('hiderStatusList');
-const hiddenDeviceUi = document.getElementById('hidden-device-ui');
-const markSelfFoundBtn = document.getElementById('markSelfFoundBtn');
-const alreadyFoundText = document.getElementById('alreadyFoundText');
-
-// Game Over View
-const gameOverView = document.getElementById('game-over-view');
-const gameResult = document.getElementById('gameResult');
-const gameOverReason = document.getElementById('gameOverReason');
-const finalPlayerList = document.getElementById('finalPlayerList');
-const hiderWinRevealSection = document.getElementById('hider-win-reveal-section');
-const hiderWinStatus = document.getElementById('hider-win-status'); // Text element for status during reveal
-const markFoundGameOverBtn = document.getElementById('markFoundGameOverBtn');
-const gameOverFoundText = document.getElementById('gameOverFoundText');
-const playAgainBtn = document.getElementById('playAgainBtn');
-
-// === Client State ===
-let myPlayerId = null;
-let currentRoomState = null;
-let seekTimerInterval = null; // For client-side display updates
-let preSeekCountdownInterval = null; // Interval for hiding countdown display
-
-// --- State for Tone.Player Audio ---
-let audioPlayers = {}; // Cache for Tone.Player objects { url: player }
-let activeUnfoundLoop = null; // Holds the Tone.Loop instance
-let activeUnfoundPlayer = null; // Holds the Tone.Player instance being looped
-let soundsPreloaded = false; // Flag to track if preloading has been initiated for the current game
-let knownAnimalSoundURLs = []; // Store known animal sound URLs to easily stop them later
-
-// === Tone.js Audio Playback using Tone.Player ===
-
 /**
- * Ensures Tone.Transport is running. Needs to be called once after Tone.start().
+ * client.js (Refactored)
+ *
+ * Client-side logic for the Hide 'n' Seek web application.
+ * Handles UI updates, user interactions, audio playback (Tone.js),
+ * and communication with the server via Socket.IO.
+ * Refactored using objects to simulate modules for better organization.
  */
-function ensureTransportRunning() {
-    if (typeof Tone !== 'undefined' && Tone.Transport && Tone.Transport.state !== 'started') {
-        try {
-            Tone.Transport.start();
-            console.log("Tone.Transport started.");
-        } catch (e) {
-            console.error("Error starting Tone.Transport:", e);
-        }
-    }
-}
 
-/**
- * Creates and stores a Tone.Player instance for a URL, initiating loading.
- * @param {string} url - The URL of the sound file.
- * @returns {Tone.Player | null} The Tone.Player instance or null on error.
- */
-function loadPlayer(url) {
-    if (!url) {
-        console.warn("[Tone.Player] loadPlayer called with empty URL.");
-        return null;
-    }
-    if (!audioPlayers[url]) {
-        console.log(`[Tone.Player] Creating player and initiating load for: ${url}`);
-        try {
-            const player = new Tone.Player(url).toDestination();
-            player.buffer.onload = () => console.log(`[Tone.Player] Buffer loaded: ${url}`);
-            player.buffer.onerror = (e) => console.error(`[Tone.Player] Buffer error ${url}:`, e);
-            audioPlayers[url] = player;
-        } catch (e) {
-             console.error(`[Tone.Player] Error creating Tone.Player for ${url}:`, e);
-             return null;
-        }
-    }
-    return audioPlayers[url];
-}
+// Wrap all logic in an IIFE to avoid polluting the global scope
+(function() {
+    'use strict';
 
-/**
- * Initiates loading for all sounds associated with the current players + victory sound.
- * Stores the animal sound URLs for later stopping.
- * @param {object} players - The players object from the current room state.
- */
-function preloadGameSounds(players) {
-     if (soundsPreloaded || typeof Tone === 'undefined' || !Tone.context || Tone.context.state !== 'running') {
-        if (!soundsPreloaded) console.warn("[Preload] Cannot preload sounds: Audio context not ready.");
-        return;
-     }
-     console.log("[Preload] Initiating sound preloading...");
-     const urlsToLoad = new Set(['/sounds/victory.mp3']);
-     knownAnimalSoundURLs = []; // Reset known animal sounds for this game
-
-     Object.values(players).forEach(p => {
-         if (p.uniqueAnimalSoundURL) {
-             urlsToLoad.add(p.uniqueAnimalSoundURL);
-             knownAnimalSoundURLs.push(p.uniqueAnimalSoundURL); // Store animal sound URL
-         }
-         if (p.uniqueUnfoundSoundURL) urlsToLoad.add(p.uniqueUnfoundSoundURL);
-     });
-
-     console.log("[Preload] URLs to load:", Array.from(urlsToLoad));
-     urlsToLoad.forEach(url => loadPlayer(url));
-     soundsPreloaded = true;
-}
-
-/**
- * Stops all currently known seeking phase (animal) sounds.
- */
-function stopAllSeekingSounds() {
-    console.log("[Audio Stop] Stopping all known seeking sounds...");
-    knownAnimalSoundURLs.forEach(url => {
-        const player = audioPlayers[url];
-        if (player && player.loaded && player.state === 'started') {
-            try {
-                player.stop(Tone.now());
-                console.log(`[Audio Stop] Stopped player for ${url}`);
-            } catch (e) {
-                console.error(`[Audio Stop] Error stopping player for ${url}:`, e);
-            }
-        }
+    // =========================================================================
+    // == Constants
+    // =========================================================================
+    const VIEW_IDS = Object.freeze({
+        JOIN: 'join-view',
+        WAITING_ROOM: 'waiting-room-view',
+        HIDING: 'hiding-view',
+        SEEKING: 'seeking-view',
+        GAME_OVER: 'game-over-view',
+        HOW_TO_PLAY: 'howToPlayModal'
     });
-}
 
-
-/**
- * Plays an audio file once using Tone.Player ONLY if it's loaded.
- * @param {string} url - The relative URL of the audio file to play.
- * @param {string} context - A string describing the context (e.g., 'seeking', 'victory') for logging.
- */
-function playAudio(url, context = 'general') {
-    if (!url) {
-        console.warn(`[${context}] playAudio called with no URL.`);
-        return;
-    }
-    if (typeof Tone === 'undefined' || !Tone.context || Tone.context.state !== 'running') {
-         console.error(`[${context}] Cannot play ${url}: Audio context not running.`);
-         return;
-    }
-    console.log(`[${context}] Request to play: ${url}`);
-    ensureTransportRunning();
-
-    const player = audioPlayers[url];
-    if (player) {
-        if (player.loaded) {
-            console.log(`[${context}] Player ${url} loaded. Starting.`);
-            try {
-                 player.stop(Tone.now()); // Stop previous instance if any
-                 player.start(Tone.now());
-            } catch (e) { console.error(`[${context}] Error starting ${url}:`, e); }
-        } else {
-            console.warn(`[${context}] Player ${url} exists but not loaded. Skipping.`);
-        }
-    } else {
-        console.error(`[${context}] Player ${url} not found in cache. Skipping.`);
-    }
-}
-
-/**
- * Stops the looping playback of the unfound sound thoroughly.
- */
-function stopUnfoundSoundLoop() {
-    // console.log("[Unfound Loop] Attempting to stop Tone.Loop..."); // Reduce noise
-    if (activeUnfoundLoop) {
-        activeUnfoundLoop.stop(Tone.now());
-        activeUnfoundLoop.dispose();
-        activeUnfoundLoop = null;
-        console.log("[Unfound Loop] Tone.Loop stopped and disposed.");
-    }
-    if (activeUnfoundPlayer) {
-        console.log("[Unfound Loop] Stopping active Tone.Player instance.");
-        activeUnfoundPlayer.stop(Tone.now());
-        activeUnfoundPlayer = null;
-    }
-}
-
-
-/**
- * Starts the looping playback for the unfound sound reveal using Tone.Loop.
- * Only starts if the Tone.Player for the URL is loaded.
- * @param {string} url - The URL of the unfound sound file.
- */
-function startUnfoundSoundLoop(url) {
-    if (!url) { console.error("[Unfound Loop] Cannot start: No URL."); return; }
-    if (typeof Tone === 'undefined' || !Tone.context || Tone.context.state !== 'running') {
-        console.error(`[Unfound Loop] Cannot start ${url}: Audio context not running.`); return;
-    }
-    stopUnfoundSoundLoop(); // Ensure previous loop is stopped
-    console.log(`[Unfound Loop] Attempting start for: ${url}`);
-    ensureTransportRunning();
-
-    const player = audioPlayers[url];
-    if (player && player.loaded) {
-        const duration = player.buffer.duration;
-        if (!duration || duration <= 0) { console.error(`[Unfound Loop] Invalid duration ${url}.`); return; }
-        const interval = duration + 1.0; // Loop slightly longer than duration
-        console.log(`[Unfound Loop] Player ${url} loaded (duration: ${duration}s). Setting up Loop interval ${interval}s.`);
-        activeUnfoundPlayer = player;
-        try {
-            activeUnfoundLoop = new Tone.Loop(time => {
-                if (activeUnfoundPlayer && activeUnfoundPlayer.loaded) {
-                     // console.log(`[Unfound Loop] Loop playing ${url} at ${time}`); // Reduce noise
-                     activeUnfoundPlayer.start(time);
-                } else { stopUnfoundSoundLoop(); } // Stop if player becomes unloaded
-            }, interval).start(Tone.now());
-            console.log(`[Unfound Loop] Tone.Loop started for ${url}.`);
-        } catch (e) { console.error(`[Unfound Loop] Error starting Loop ${url}:`, e); activeUnfoundPlayer = null; }
-    } else if (player && !player.loaded) {
-         console.error(`[Unfound Loop] Player ${url} exists but not loaded. Cannot start loop.`);
-    } else {
-         console.error(`[Unfound Loop] Player ${url} not found in cache. Cannot start loop.`);
-    }
-}
-
-
-// === View Management ===
-/**
- * Shows the specified view and hides all others.
- * @param {string} viewId - The ID of the view element to show.
- */
-function showView(viewId) {
-    views.forEach(view => {
-        if (view.id === viewId) {
-            view.classList.add('active');
-            view.classList.remove('hidden');
-        } else {
-            view.classList.remove('active');
-            view.classList.add('hidden');
-        }
+    // Mirror server-side constants needed on client
+    const GAME_STATE = Object.freeze({
+        WAITING: 'Waiting',
+        HIDING: 'Hiding',
+        SEEKING: 'Seeking',
+        GAME_OVER: 'GameOver',
     });
-    // Special handling for modal
-    if (viewId === 'howToPlayModal') {
-        howToPlayModal.classList.remove('hidden');
-        howToPlayModal.classList.add('flex');
-    } else if (howToPlayModal.classList.contains('flex')) {
-        howToPlayModal.classList.add('hidden');
-        howToPlayModal.classList.remove('flex');
-    }
-    console.log("Showing view:", viewId);
-}
 
-// === Helper Functions ===
-/**
- * Formats seconds into MM:SS format.
- * @param {number} totalSeconds - The total seconds to format.
- * @returns {string} Formatted time string.
- */
-function formatTime(totalSeconds) {
-    if (totalSeconds < 0) totalSeconds = 0;
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = Math.floor(totalSeconds % 60);
-    return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-}
-
-/**
- * Renders the player list in the Waiting Room. Shows "Phone X".
- * Highlights the Hider.
- * @param {object} players - The players object from the server state.
- * @param {string} myId - The client's own socket ID.
- */
-function renderPlayerList(players, myId) {
-    playerList.innerHTML = ''; // Clear previous list
-    Object.values(players).sort((a, b) => a.number - b.number).forEach(player => {
-        const li = document.createElement('li');
-        li.classList.add('text-lg', 'p-1'); // Basic styling
-        // Display "Phone X"
-        li.textContent = `Phone ${player.number}`;
-        // Highlight if this client is the Hider (using the role property)
-        if (player.id === myId && player.role === 'Hider') {
-             li.classList.add('bg-indigo-900', 'rounded', 'font-semibold', 'text-white');
-        }
-        playerList.appendChild(li);
+    const PLAYER_ROLE = Object.freeze({
+        HIDER: 'Hider',
+        SEEKER: 'Seeker',
     });
-}
 
-
-/**
- * Renders the status of hiders (phones) in the Seeking Phase.
- * @param {object} players - The players object from the server state.
- */
-function renderHiderStatusList(players) {
-    hiderStatusList.innerHTML = '';
-    Object.values(players).sort((a, b) => a.number - b.number).forEach(player => {
-        const li = document.createElement('li');
-        li.classList.add('text-lg');
-        if (player.isFound) {
-            li.innerHTML = `Phone ${player.number}: <span class="text-green-400">✅ Found</span>`;
-        } else {
-            li.innerHTML = `Phone ${player.number}: <span class="text-gray-400">❓ Hidden</span>`;
-        }
-        hiderStatusList.appendChild(li);
+     const WINNER_TYPE = Object.freeze({
+        HIDER: 'Hider',
+        SEEKERS: 'Seekers',
     });
-}
 
-/**
- * Renders the final player status list in the Game Over view.
- * Highlights the player currently playing the reveal sound.
- * @param {object} players - The players object from the server state.
- */
-function renderFinalPlayerList(players) {
-    finalPlayerList.innerHTML = '';
-    Object.values(players).sort((a, b) => a.number - b.number).forEach(player => {
-        const li = document.createElement('li');
-        li.classList.add('text-lg', 'p-1', 'rounded');
-        if (player.isFound) {
-            li.innerHTML = `Phone ${player.number} <span class="text-green-400">Found ✅</span>`;
-        } else {
-            li.innerHTML = `Phone ${player.number} <span class="text-red-400">Not Found ❌</span>`;
-            // Highlight the active unfound player during reveal
-            if (currentRoomState?.gameState === 'GameOver' && player.id === currentRoomState.activeUnfoundPlayerId) {
-                 li.classList.add('bg-yellow-800', 'font-bold', 'animate-pulse');
-                 li.innerHTML += ' <span class="text-yellow-300">(Playing Sound...)</span>'; // Indicate sound playing
-            }
-        }
-        finalPlayerList.appendChild(li);
+    // Settings constants for client-side validation/defaults
+    const MIN_SEEK_TIME_LIMIT_S = 15;
+    const MAX_SEEK_TIME_LIMIT_S = 600;
+    const DEFAULT_SOUND_PLAYS_PER_PLAYER = 6;
+    const MIN_SOUND_PLAYS = 1;
+    const MAX_SOUND_PLAYS = 20;
+
+    const SOUND_URLS = Object.freeze({
+        VICTORY: '/sounds/victory.mp3',
+        FOUND: '/sounds/found.mp3',
+        FAIL: '/sounds/fail.mp3' // For game over reveal find
     });
-}
 
-/**
- * Updates the timer display during the Seeking phase based on server start time.
- */
-function updateTimerDisplay() {
-    if (currentRoomState && currentRoomState.gameState === 'Seeking' && currentRoomState.seekStartTime) {
-        const elapsed = (Date.now() - currentRoomState.seekStartTime) / 1000;
-        const remaining = currentRoomState.seekTimeLimit - elapsed;
-        timerDisplay.textContent = formatTime(remaining);
-        if (remaining <= 0 && seekTimerInterval) {
-             clearInterval(seekTimerInterval);
-             seekTimerInterval = null;
-             timerDisplay.textContent = "00:00";
-        }
-    } else {
-        // Display the full time limit if seeking hasn't started or state is missing
-        timerDisplay.textContent = formatTime(currentRoomState?.seekTimeLimit || 0);
-        if(seekTimerInterval) {
-            clearInterval(seekTimerInterval);
-            seekTimerInterval = null;
-        }
-    }
-}
+    const VIBRATION_DURATION_MS = 200;
+    const ROOM_CODE_LENGTH = 5; // Used for input validation
 
+    // =========================================================================
+    // == Client State
+    // =========================================================================
+    let myPlayerId = null;
+    let currentRoomState = null;
+    let seekTimerInterval = null;
+    let audioContextStarted = false;
+    let soundsPreloaded = false;
+    let activeViewId = VIEW_IDS.JOIN; // Track the currently intended active view
 
-// === Socket Event Handlers ===
+    // =========================================================================
+    // == DOM Element Cache (Managed by UIManager)
+    // =========================================================================
+    const DOMElements = {}; // Populated by UIManager.init
 
-socket.on('connect', () => {
-    console.log('Connected to server with ID:', socket.id);
-    myPlayerId = socket.id; // Store my ID when connected
-});
+    // =========================================================================
+    // == Audio Manager (Tone.js)
+    // =========================================================================
+    const AudioManager = {
+        audioPlayers: {}, // Cache for Tone.Player instances { url: Tone.Player }
+        activeUnfoundLoop: null,
+        activeUnfoundPlayer: null,
+        knownAnimalSoundURLs: [], // URLs specific to the current game instance
 
-socket.on('disconnect', (reason) => {
-    console.log('Disconnected from server:', reason);
-    stopUnfoundSoundLoop(); // Stop any looping sounds on disconnect
-    // If disconnected mid-game, show an alert and reset view
-    if (currentRoomState && currentRoomState.gameState !== 'Waiting' && currentRoomState.gameState !== 'GameOver') {
-        showView('join-view');
-        // Use a more user-friendly alert or modal here in a real app
-        alert('Connection lost to the server. Please rejoin or create a new game.');
-        currentRoomState = null; // Reset local state
-        // Clear intervals
-        if(seekTimerInterval) clearInterval(seekTimerInterval);
-        seekTimerInterval = null;
-        if(preSeekCountdownInterval) clearInterval(preSeekCountdownInterval);
-        preSeekCountdownInterval = null;
-        // Reset audio state
-        soundsPreloaded = false;
-        Object.values(audioPlayers).forEach(player => player?.dispose());
-        audioPlayers = {};
-        knownAnimalSoundURLs = [];
-    }
-});
-
-// Handle generic error messages from the server
-socket.on('errorMsg', (message) => {
-    console.error('Server Error:', message);
-    // Display error in the appropriate view's error paragraph
-    if (joinView.classList.contains('active')) {
-        joinError.textContent = message;
-    } else if (waitingRoomView.classList.contains('active')) {
-        startError.textContent = message;
-    } else {
-        // Fallback alert if no specific view is active
-        alert(`Error: ${message}`);
-    }
-    // Clear the error message after a few seconds
-    setTimeout(() => {
-        joinError.textContent = '';
-        startError.textContent = '';
-    }, 4000);
-});
-
-// Main handler for receiving state updates from the server
-socket.on('updateState', (state) => {
-    console.log('Received state update:', state);
-    const previousState = currentRoomState?.gameState; // Store previous state for transitions
-    currentRoomState = state; // Store the latest state FIRST
-
-    // --- Preload sounds ---
-    // Preload sounds if in Waiting or Hiding state and not already preloaded
-    if ((state.gameState === 'Waiting' || state.gameState === 'Hiding') && !soundsPreloaded) {
-        if (typeof Tone !== 'undefined' && Tone.context && Tone.context.state === 'running') {
-             preloadGameSounds(state.players);
-        } else {
-            console.warn("Cannot preload sounds yet: Audio context not running.");
-        }
-    }
-    // Reset preload flag and audio cache if returning to Waiting after Game Over
-    if (state.gameState === 'Waiting' && previousState === 'GameOver') {
-        console.log("Resetting preload flag and audio cache for new game.");
-        soundsPreloaded = false;
-        Object.values(audioPlayers).forEach(player => player?.dispose());
-        audioPlayers = {};
-        knownAnimalSoundURLs = [];
-    }
-
-
-    // Clear intervals/loops based on state transitions
-    if (state.gameState !== 'Seeking' && seekTimerInterval) {
-        clearInterval(seekTimerInterval);
-        seekTimerInterval = null;
-    }
-    if (state.gameState !== 'Hiding' && preSeekCountdownInterval) {
-        clearInterval(preSeekCountdownInterval);
-        preSeekCountdownInterval = null;
-        hidingCountdown.textContent = '-'; // Reset countdown display
-    }
-    // Stop unfound loop unless it's specifically meant to be playing (Game Over, Hider Win, this client is active)
-    if (!(state.gameState === 'GameOver' && state.winner === 'Hider' && state.activeUnfoundPlayerId === myPlayerId)) {
-         stopUnfoundSoundLoop();
-    }
-    // Stop all seeking (animal) sounds if transitioning out of the Seeking state
-    if (previousState === 'Seeking' && state.gameState !== 'Seeking') {
-        stopAllSeekingSounds();
-    }
-
-
-    // --- Update UI based on Game State ---
-    switch (state.gameState) {
-        case 'Waiting':
-            showView('waiting-room-view');
-            roomCodeDisplay.textContent = state.roomCode;
-            seekTimeLimitInput.value = state.seekTimeLimit;
-            renderPlayerList(state.players, myPlayerId); // Render player list (now highlights Hider)
-
-            // --- Check Hider Role and Show Controls ---
-            const myPlayerDataWaiting = state.players[myPlayerId]; // Get my data using my ID
-            const amIHiderWaiting = myPlayerDataWaiting?.role === 'Hider'; // Check role
-
-            // Log debugging info (can be removed in production)
-            console.log("[Waiting View] My ID:", myPlayerId);
-            console.log("[Waiting View] My Player Data:", myPlayerDataWaiting ? JSON.stringify(myPlayerDataWaiting) : 'Not Found');
-            console.log("[Waiting View] Am I Hider Check:", amIHiderWaiting);
-            console.log("[Waiting View] Hider Controls Element:", hiderControls);
-
-            // Toggle visibility of Hider controls based on the role check
-            hiderControls.classList.toggle('hidden', !amIHiderWaiting);
-
-            // Enable/disable start button if Hider controls are visible
-            if(amIHiderWaiting && startHidingBtn) {
-                 const canStart = Object.keys(state.players).length >= 2; // Need at least 2 players
-                 startHidingBtn.disabled = !canStart;
-                 startError.textContent = canStart ? '' : 'Waiting for more players...';
-            } else if (!amIHiderWaiting) {
-                 startError.textContent = ''; // Clear error if not hider
+        /** Attempts to start the Tone.js Audio Context. MUST be called after user interaction. */
+        attemptStart: function() {
+            // Only attempt if Tone is available and context is not already running
+            if (!audioContextStarted && typeof Tone !== 'undefined' && Tone.context && Tone.context.state !== 'running') {
+                console.log("Attempting Tone.start() due to user interaction...");
+                Tone.start().then(() => {
+                    console.log("Tone.start() successful. Audio context is running.");
+                    audioContextStarted = true;
+                    this.ensureTransportRunning();
+                    // If a game state already exists (e.g., user reconnected), try preloading now
+                    // Use client-side GAME_STATE constants
+                    if (currentRoomState && (currentRoomState.gameState === GAME_STATE.WAITING || currentRoomState.gameState === GAME_STATE.HIDING)) {
+                         this.preloadGameSounds(currentRoomState.players);
+                    }
+                }).catch(e => {
+                    console.error("Tone.start() failed:", e);
+                    // Show user-facing error in the join view's error area
+                    UIManager.showError("Audio could not be initialized. Sound may not work.", DOMElements.joinError);
+                });
+            } else if (audioContextStarted) {
+                // If context already started, ensure transport is running
+                this.ensureTransportRunning();
+            } else if (typeof Tone === 'undefined') {
+                 console.error("Tone.js not available. Cannot start audio.");
+                 UIManager.showError("Audio library failed to load. Please refresh.", DOMElements.joinError);
             }
-            // --- End Hider Role Check ---
+        },
 
-            // Reset UI elements from other states
-            hidingCountdown.textContent = '-';
-            timerDisplay.textContent = formatTime(state.seekTimeLimit);
-            playAgainBtn.classList.add('hidden');
-            hiderWinRevealSection.classList.add('hidden');
-            break;
-
-        case 'Hiding':
-            showView('hiding-view');
-            const myPlayerDataHiding = state.players[myPlayerId];
-            let readyCount = 0;
-            // Count how many players are ready
-            Object.values(state.players).forEach(p => { if (p.isReady) readyCount++; });
-            // Update status text
-            hidingStatus.textContent = `(${readyCount}/${Object.keys(state.players).length} phones confirmed hidden)`;
-
-            const isClientReady = myPlayerDataHiding?.isReady;
-            // Show/hide the confirm button vs the confirmation text
-            confirmHiddenBtn.classList.toggle('hidden', isClientReady);
-            hidingConfirmedText.classList.toggle('hidden', !isClientReady);
-            // Hiding instructions text is static in HTML
-
-            // Ensure countdown display is reset if interval isn't running
-            if (!preSeekCountdownInterval) {
-                 hidingCountdown.textContent = '-';
+        /** Ensures Tone.Transport is running if the audio context is active. */
+        ensureTransportRunning: function() {
+            if (audioContextStarted && typeof Tone !== 'undefined' && Tone.Transport && Tone.Transport.state !== 'started') {
+                try {
+                    Tone.Transport.start();
+                } catch (e) {
+                    console.error("Error starting Tone.Transport:", e);
+                }
             }
-            break;
+        },
 
-        case 'Seeking':
-            showView('seeking-view');
-            renderHiderStatusList(state.players); // Update list of found/hidden phones
-            // Start the client-side timer display if it's not running and start time is known
-            if (!seekTimerInterval && state.seekStartTime) {
-                updateTimerDisplay(); // Initial update
-                seekTimerInterval = setInterval(updateTimerDisplay, 1000); // Update every second
-            } else if (!state.seekStartTime) {
-                // If start time isn't set yet, just display the full limit
-                timerDisplay.textContent = formatTime(state.seekTimeLimit);
+        /** Creates/caches a Tone.Player, initiating loading. */
+        loadPlayer: function(url) {
+            if (!url || typeof url !== 'string') {
+                console.warn("[Audio Load] Invalid URL:", url);
+                return null;
             }
-            const myPlayerDataSeeking = state.players[myPlayerId];
-            const isClientFoundSeeking = myPlayerDataSeeking?.isFound;
-            // Show/hide the "Mark Found" button vs the "Found!" text
-            hiddenDeviceUi.classList.toggle('hidden', isClientFoundSeeking);
-            alreadyFoundText.classList.toggle('hidden', !isClientFoundSeeking);
-            break;
+            if (!this.audioPlayers[url]) {
+                console.log(`[Audio Load] Creating player for: ${url}`);
+                try {
+                    const player = new Tone.Player(url).toDestination();
+                    player.buffer.onload = () => console.log(`[Audio Load] Buffer loaded: ${url}`);
+                    player.buffer.onerror = (e) => console.error(`[Audio Load] Buffer error for ${url}:`, e);
+                    this.audioPlayers[url] = player;
+                } catch (e) {
+                    console.error(`[Audio Load] Error creating Tone.Player for ${url}:`, e);
+                    return null;
+                }
+            }
+            return this.audioPlayers[url];
+        },
 
-        case 'GameOver':
-            showView('game-over-view');
-            renderFinalPlayerList(state.players); // Render final status list (now highlights active reveal player)
+        /** Initiates loading for all necessary game sounds. */
+        preloadGameSounds: function(players) {
+            if (soundsPreloaded || !audioContextStarted || typeof Tone === 'undefined') {
+                if (!soundsPreloaded && !audioContextStarted) console.warn("[Preload] Cannot preload: Audio context not running.");
+                return;
+            }
+            console.log("[Preload] Initiating sound preloading...");
 
-            if (state.winner === 'Seekers') {
-                gameResult.textContent = 'Seekers Win!';
-                gameResult.className = 'text-3xl font-semibold text-green-400';
-                gameOverReason.textContent = 'All phones were found before time ran out.';
-                hiderWinRevealSection.classList.add('hidden'); // Hide the reveal section
-            } else if (state.winner === 'Hider') {
-                gameResult.textContent = 'Hider Wins!';
-                gameResult.className = 'text-3xl font-semibold text-red-400';
-                gameOverReason.textContent = 'Time ran out before all phones were found.';
-                hiderWinRevealSection.classList.remove('hidden'); // Show the reveal section
+            const urlsToLoad = new Set([SOUND_URLS.VICTORY, SOUND_URLS.FOUND, SOUND_URLS.FAIL]);
+            this.knownAnimalSoundURLs = []; // Reset for this game
 
-                const myPlayerDataGameOver = state.players[myPlayerId];
-                const amIActiveUnfound = state.activeUnfoundPlayerId === myPlayerId;
-                const isClientFoundGameOver = myPlayerDataGameOver?.isFound;
+            Object.values(players || {}).forEach(p => {
+                if (p.uniqueAnimalSoundURL) {
+                    urlsToLoad.add(p.uniqueAnimalSoundURL);
+                    this.knownAnimalSoundURLs.push(p.uniqueAnimalSoundURL);
+                }
+                if (p.uniqueUnfoundSoundURL) {
+                    urlsToLoad.add(p.uniqueUnfoundSoundURL);
+                }
+            });
 
-                // FIX: Update status text only when reveal is finished or no one is active
-                if (state.activeUnfoundPlayerId) {
-                    // Clear the status text while a player is actively revealing
-                    hiderWinStatus.textContent = ''; // Removed "Finding Phone X..." text
-                    hiderWinStatus.className = 'text-xl'; // Reset class if needed
+            console.log("[Preload] URLs to load:", Array.from(urlsToLoad));
+            urlsToLoad.forEach(url => this.loadPlayer(url));
+            soundsPreloaded = true;
+        },
+
+        /** Stops playback for all known seeking phase (animal) sounds. */
+        stopAllSeekingSounds: function() {
+            console.log("[Audio Stop] Stopping all known seeking sounds...");
+            this.knownAnimalSoundURLs.forEach(url => {
+                const player = this.audioPlayers[url];
+                if (player && player.loaded && player.state === 'started') {
+                    try {
+                        player.stop(Tone.now());
+                    } catch (e) {
+                        console.error(`[Audio Stop] Error stopping player for ${url}:`, e);
+                    }
+                }
+            });
+        },
+
+        /** Plays a sound file once using its cached Tone.Player instance. */
+        play: function(url, context = 'general') {
+            if (!url) {
+                console.warn(`[${context}] playAudio called with invalid URL.`);
+                return;
+            }
+            if (!audioContextStarted || typeof Tone === 'undefined') {
+                console.error(`[${context}] Cannot play ${url}: Audio context not running.`);
+                return;
+            }
+            this.ensureTransportRunning();
+
+            const player = this.audioPlayers[url];
+            if (player) {
+                if (player.loaded) {
+                    try {
+                        player.stop(Tone.now()); // Stop previous playback first
+                        player.start(Tone.now());
+                    } catch (e) {
+                        console.error(`[${context}] Error starting playback for ${url}:`, e);
+                    }
                 } else {
-                    // Display completion message when queue is empty
-                    hiderWinStatus.textContent = 'All remaining phones found!';
-                    hiderWinStatus.className = 'text-xl text-green-400';
-                    stopUnfoundSoundLoop(); // Ensure loop stops when reveal finishes
+                    console.warn(`[${context}] Player ${url} exists but not loaded. Skipping.`);
+                    // Optionally trigger loading again if needed
+                    // this.loadPlayer(url);
+                }
+            } else {
+                console.error(`[${context}] Player ${url} not found. Cannot play.`);
+                this.loadPlayer(url); // Attempt to load if missing
+            }
+        },
+
+        /** Stops the looping playback of the unfound sound. */
+        stopUnfoundSoundLoop: function() {
+            if (this.activeUnfoundLoop) {
+                try {
+                    this.activeUnfoundLoop.stop(Tone.now()).dispose();
+                    console.log("[Unfound Loop] Tone.Loop stopped and disposed.");
+                } catch(e) { console.error("[Unfound Loop] Error stopping/disposing Tone.Loop:", e); }
+                this.activeUnfoundLoop = null;
+            }
+            if (this.activeUnfoundPlayer) {
+                 if (this.activeUnfoundPlayer.loaded && this.activeUnfoundPlayer.state === 'started') {
+                     try { this.activeUnfoundPlayer.stop(Tone.now()); }
+                     catch(e) { console.error("[Unfound Loop] Error stopping active Tone.Player:", e); }
+                 }
+                this.activeUnfoundPlayer = null;
+            }
+        },
+
+        /** Starts looping playback for the unfound sound reveal. */
+        startUnfoundSoundLoop: function(url) {
+            if (!url) { console.error("[Unfound Loop] Cannot start: No URL provided."); return; }
+            if (!audioContextStarted || typeof Tone === 'undefined') {
+                console.error(`[Unfound Loop] Cannot start ${url}: Audio context not running.`); return;
+            }
+
+            this.stopUnfoundSoundLoop(); // Ensure previous loop is stopped
+            console.log(`[Unfound Loop] Attempting to start loop for: ${url}`);
+            this.ensureTransportRunning();
+
+            const player = this.audioPlayers[url];
+            if (player && player.loaded) {
+                const duration = player.buffer.duration;
+                if (!duration || duration <= 0) {
+                    console.error(`[Unfound Loop] Cannot start: Invalid audio duration for ${url}.`); return;
+                }
+                const intervalSeconds = duration + 1.0; // Loop slightly longer than duration
+                console.log(`[Unfound Loop] Player ${url} loaded (Duration: ${duration.toFixed(2)}s). Interval: ${intervalSeconds.toFixed(2)}s.`);
+
+                this.activeUnfoundPlayer = player;
+                try {
+                    this.activeUnfoundLoop = new Tone.Loop(time => {
+                        if (this.activeUnfoundPlayer && this.activeUnfoundPlayer.loaded) {
+                            this.activeUnfoundPlayer.start(time);
+                            if (navigator.vibrate) { navigator.vibrate(VIBRATION_DURATION_MS); }
+                        } else {
+                            console.warn("[Unfound Loop] Player became unloaded/invalid. Stopping loop.");
+                            this.stopUnfoundSoundLoop();
+                        }
+                    }, intervalSeconds).start(Tone.now());
+                    console.log(`[Unfound Loop] Tone.Loop started successfully for ${url}.`);
+                } catch (e) {
+                    console.error(`[Unfound Loop] Error starting Tone.Loop for ${url}:`, e);
+                    this.activeUnfoundPlayer = null;
+                }
+            } else {
+                 console.error(`[Unfound Loop] Cannot start: Player ${url} not found or not loaded.`);
+                 if (!player) this.loadPlayer(url); // Attempt load if missing
+            }
+        },
+
+        /** Resets audio state and disposes players. */
+        resetState: function() {
+            console.log("[Audio Reset] Resetting audio state.");
+            this.stopUnfoundSoundLoop();
+            this.stopAllSeekingSounds();
+
+            Object.values(this.audioPlayers).forEach(player => {
+                try { player?.dispose(); }
+                catch (e) { console.warn("[Audio Reset] Error disposing player:", e); }
+            });
+
+            this.audioPlayers = {};
+            this.knownAnimalSoundURLs = [];
+            soundsPreloaded = false;
+            // Keep audioContextStarted = true if it was already started
+        }
+    };
+
+    // =========================================================================
+    // == UI Manager
+    // =========================================================================
+    const UIManager = {
+        /** Caches all required DOM elements. */
+        init: function() {
+            console.log("UIManager: Initializing and caching DOM elements.");
+            // Query all views
+            DOMElements.views = document.querySelectorAll('.view');
+
+            // Cache elements for each view/component
+            DOMElements.howToPlayModal = document.getElementById('howToPlayModal');
+            DOMElements.closeHowToPlayBtn = document.getElementById('closeHowToPlayBtn');
+            DOMElements.howToPlayBtn = document.getElementById('howToPlayBtn');
+
+            DOMElements.joinView = document.getElementById(VIEW_IDS.JOIN);
+            DOMElements.roomCodeInput = document.getElementById('roomCodeInput');
+            DOMElements.joinRoomBtn = document.getElementById('joinRoomBtn');
+            DOMElements.createRoomBtn = document.getElementById('createRoomBtn');
+            DOMElements.joinError = document.getElementById('join-error');
+
+            DOMElements.waitingRoomView = document.getElementById(VIEW_IDS.WAITING_ROOM);
+            DOMElements.roomCodeDisplay = document.getElementById('roomCodeDisplay');
+            DOMElements.playerList = document.getElementById('playerList');
+            DOMElements.hiderControls = document.getElementById('hider-controls');
+            DOMElements.seekTimeLimitInput = document.getElementById('seekTimeLimit');
+            DOMElements.soundPlaysInput = document.getElementById('soundPlaysInput');
+            DOMElements.updateSettingsBtn = document.getElementById('updateSettingsBtn');
+            DOMElements.startHidingBtn = document.getElementById('startHidingBtn');
+            DOMElements.startError = document.getElementById('start-error');
+            DOMElements.backToJoinBtn = document.getElementById('backToJoinBtn');
+
+            DOMElements.hidingView = document.getElementById(VIEW_IDS.HIDING);
+            DOMElements.hidingInstructions = document.getElementById('hiding-instructions');
+            DOMElements.hidingStatus = document.getElementById('hiding-status');
+            DOMElements.confirmHiddenBtn = document.getElementById('confirmHiddenBtn');
+            DOMElements.hidingConfirmedText = document.getElementById('hiding-confirmed-text');
+            DOMElements.hidingCountdown = document.getElementById('hiding-countdown');
+
+            DOMElements.seekingView = document.getElementById(VIEW_IDS.SEEKING);
+            DOMElements.timerDisplay = document.getElementById('timerDisplay');
+            DOMElements.hiderStatusList = document.getElementById('hiderStatusList');
+            DOMElements.hiddenDeviceUi = document.getElementById('hidden-device-ui');
+            DOMElements.markSelfFoundBtn = document.getElementById('markSelfFoundBtn');
+            DOMElements.alreadyFoundText = document.getElementById('alreadyFoundText');
+
+            DOMElements.gameOverView = document.getElementById(VIEW_IDS.GAME_OVER);
+            DOMElements.gameResult = document.getElementById('gameResult');
+            DOMElements.gameOverReason = document.getElementById('gameOverReason');
+            DOMElements.finalPlayerList = document.getElementById('finalPlayerList');
+            DOMElements.hiderWinRevealSection = document.getElementById('hider-win-reveal-section');
+            DOMElements.hiderWinStatus = document.getElementById('hider-win-status');
+            DOMElements.markFoundGameOverBtn = document.getElementById('markFoundGameOverBtn');
+            DOMElements.gameOverFoundText = document.getElementById('gameOverFoundText');
+            DOMElements.playAgainBtn = document.getElementById('playAgainBtn');
+
+            // Verify all essential elements were found
+             for (const key in DOMElements) {
+                 // Check NodeLists separately
+                 if (key === 'views') {
+                     if (!DOMElements.views || DOMElements.views.length === 0) {
+                         console.error(`UIManager Init Error: View elements not found!`);
+                     }
+                 } else if (!DOMElements[key]) {
+                     console.error(`UIManager Init Error: Element with key "${key}" not found! Check HTML IDs.`);
+                 }
+             }
+        },
+
+        /** Shows the specified view and hides others. */
+        showView: function(viewIdToShow) {
+            activeViewId = viewIdToShow; // Update tracked view
+            console.log("Showing view:", viewIdToShow);
+            DOMElements.views.forEach(view => {
+                const isActive = view.id === viewIdToShow;
+                view.classList.toggle('active', isActive);
+                view.classList.toggle('hidden', !isActive);
+                // Special handling for modal flex display
+                if (view.id === VIEW_IDS.HOW_TO_PLAY) {
+                    view.classList.toggle('flex', isActive);
+                }
+            });
+        },
+
+        /** Formats seconds into MM:SS. */
+        formatTime: function(totalSeconds) {
+            const seconds = Math.max(0, Math.floor(totalSeconds));
+            const minutes = Math.floor(seconds / 60);
+            const remainingSeconds = seconds % 60;
+            return `${minutes.toString().padStart(2, '0')}:${remainingSeconds.toString().padStart(2, '0')}`;
+        },
+
+        /** Renders a list of players with status indicators. Uses client-side constants. */
+        _renderPlayerList: function(listElement, players, myId, isFinal = false, activeUnfoundId = null) {
+            if (!listElement) return;
+            listElement.innerHTML = ''; // Clear previous list
+
+            Object.values(players || {})
+                .sort((a, b) => a.number - b.number)
+                .forEach(player => {
+                    const li = document.createElement('li');
+                    li.classList.add('text-lg', 'p-1', 'rounded');
+
+                    let content = `Phone ${player.number}`; // Base content
+
+                    // Status indicators for Seeking/Game Over
+                    if (isFinal) { // Game Over List
+                        if (player.isFound) {
+                            content += ' <span class="text-green-400">Found ✅</span>';
+                        } else {
+                            content += ' <span class="text-red-400">Not Found ❌</span>';
+                            if (player.id === activeUnfoundId) {
+                                li.classList.add('bg-yellow-800', 'font-bold', 'animate-pulse');
+                                content += ' <span class="text-yellow-300">(Playing Sound...)</span>';
+                            }
+                        }
+                    } else if (currentRoomState?.gameState === GAME_STATE.SEEKING) { // Seeking List
+                         if (player.isFound) {
+                            content += ': <span class="text-green-400">✅ Found</span>';
+                        } else {
+                            content += ': <span class="text-gray-400">❓ Hidden</span>';
+                        }
+                    }
+
+                    // Highlight self in waiting room without adding text
+                    if (player.id === myId && !isFinal) {
+                        li.classList.add('ring-1', 'ring-teal-400');
+                    }
+
+                    li.innerHTML = content;
+                    listElement.appendChild(li);
+            });
+        },
+
+        /** Updates the timer display during Seeking phase. Uses client-side constants. */
+        updateTimerDisplay: function() {
+            const state = currentRoomState;
+            // Use client-side GAME_STATE constant
+            if (state && state.gameState === GAME_STATE.SEEKING && state.seekStartTime) {
+                const elapsedSeconds = (Date.now() - state.seekStartTime) / 1000;
+                const remainingSeconds = state.seekTimeLimit - elapsedSeconds;
+                DOMElements.timerDisplay.textContent = this.formatTime(remainingSeconds);
+
+                if (remainingSeconds <= 0 && seekTimerInterval) {
+                    clearInterval(seekTimerInterval);
+                    seekTimerInterval = null;
+                    DOMElements.timerDisplay.textContent = "00:00";
+                }
+            } else {
+                if (seekTimerInterval) { clearInterval(seekTimerInterval); seekTimerInterval = null; }
+                DOMElements.timerDisplay.textContent = this.formatTime(state?.seekTimeLimit || 0);
+            }
+        },
+
+        /** Updates the UI for the Waiting Room view. Uses client-side constants. */
+        updateWaitingRoomUI: function(state) {
+            DOMElements.roomCodeDisplay.textContent = state.roomCode;
+            DOMElements.seekTimeLimitInput.value = state.seekTimeLimit;
+            // Use state value if available, otherwise default from client-side constants
+            DOMElements.soundPlaysInput.value = state.soundPlaysPerPlayer ?? DEFAULT_SOUND_PLAYS_PER_PLAYER;
+
+            this._renderPlayerList(DOMElements.playerList, state.players, myPlayerId);
+
+            const myPlayerData = state.players[myPlayerId];
+            // Use client-side PLAYER_ROLE constant
+            const amIHider = myPlayerData?.role === PLAYER_ROLE.HIDER;
+
+            DOMElements.hiderControls.classList.toggle('hidden', !amIHider);
+
+            if (amIHider) {
+                // Use client-side MIN_PLAYERS_TO_START if needed, though logic relies on length check
+                const canStart = Object.keys(state.players).length >= 2; // Assuming MIN_PLAYERS_TO_START is 2
+                DOMElements.startHidingBtn.disabled = !canStart;
+                this.showError(canStart ? '' : 'Waiting for more players...', DOMElements.startError, 0); // Clear error if can start
+            } else {
+                 this.showError('', DOMElements.startError, 0); // Clear error if not hider
+            }
+
+            // Reset elements from other views
+            DOMElements.hidingCountdown.textContent = '-';
+            DOMElements.timerDisplay.textContent = this.formatTime(state.seekTimeLimit);
+            DOMElements.playAgainBtn.classList.add('hidden');
+            DOMElements.hiderWinRevealSection.classList.add('hidden');
+            this.clearError(DOMElements.joinError); // Clear join error when entering waiting room
+        },
+
+        /** Updates the UI for the Hiding Phase view. */
+        updateHidingPhaseUI: function(state) {
+            const myPlayerData = state.players[myPlayerId];
+            let readyCount = 0;
+            Object.values(state.players).forEach(p => { if (p.isReady) readyCount++; });
+
+            DOMElements.hidingStatus.textContent = `(${readyCount}/${Object.keys(state.players).length} phones confirmed hidden)`;
+
+            const isClientReady = myPlayerData?.isReady;
+            DOMElements.confirmHiddenBtn.classList.toggle('hidden', !!isClientReady);
+            DOMElements.hidingConfirmedText.classList.toggle('hidden', !isClientReady);
+            // Countdown display handled by 'preSeekCountdown' event
+        },
+
+         /** Updates the pre-seek countdown display. */
+        updatePreSeekCountdown: function(value) {
+             if (activeViewId === VIEW_IDS.HIDING) { // Only update if view is active
+                const displayValue = value > 0 ? value : "0";
+                DOMElements.hidingCountdown.textContent = displayValue;
+                const isPulsing = value <= 3 && value > 0;
+                DOMElements.hidingCountdown.classList.toggle('pulse', isPulsing);
+                DOMElements.hidingCountdown.classList.toggle('text-red-600', isPulsing);
+            }
+        },
+
+        /** Updates the UI for the Seeking Phase view. Uses client-side constants. */
+        updateSeekingPhaseUI: function(state) {
+            this._renderPlayerList(DOMElements.hiderStatusList, state.players, myPlayerId);
+
+            // Use client-side GAME_STATE constant
+            if (!seekTimerInterval && state.gameState === GAME_STATE.SEEKING && state.seekStartTime) {
+                this.updateTimerDisplay(); // Initial update
+                seekTimerInterval = setInterval(() => this.updateTimerDisplay(), 1000);
+            } else if (!state.seekStartTime) {
+                DOMElements.timerDisplay.textContent = this.formatTime(state.seekTimeLimit);
+            }
+
+            const myPlayerData = state.players[myPlayerId];
+            const isClientFound = myPlayerData?.isFound;
+            DOMElements.hiddenDeviceUi.classList.toggle('hidden', !!isClientFound);
+            DOMElements.alreadyFoundText.classList.toggle('hidden', !isClientFound);
+        },
+
+        /** Updates the UI for the Game Over view. Uses client-side constants. */
+        updateGameOverUI: function(state) {
+            this._renderPlayerList(DOMElements.finalPlayerList, state.players, myPlayerId, true, state.activeUnfoundPlayerId);
+
+            // Use client-side WINNER_TYPE constants
+            if (state.winner === WINNER_TYPE.SEEKERS) {
+                DOMElements.gameResult.textContent = 'Seekers Win!';
+                DOMElements.gameResult.className = 'text-3xl font-semibold text-green-400';
+                DOMElements.gameOverReason.textContent = 'All phones were found before time ran out.';
+                DOMElements.hiderWinRevealSection.classList.add('hidden');
+            } else if (state.winner === WINNER_TYPE.HIDER) {
+                DOMElements.gameResult.textContent = 'Hider Wins!';
+                DOMElements.gameResult.className = 'text-3xl font-semibold text-red-400';
+                DOMElements.gameOverReason.textContent = 'Time ran out before all phones were found.';
+                DOMElements.hiderWinRevealSection.classList.remove('hidden');
+
+                const myPlayerData = state.players[myPlayerId];
+                const amIActiveUnfound = state.activeUnfoundPlayerId === myPlayerId;
+                const isClientFound = myPlayerData?.isFound;
+
+                if (state.activeUnfoundPlayerId) {
+                    DOMElements.hiderWinStatus.textContent = `Finding remaining phones...`;
+                    DOMElements.hiderWinStatus.className = 'text-xl text-yellow-300';
+                } else {
+                    DOMElements.hiderWinStatus.textContent = 'All remaining phones revealed!';
+                    DOMElements.hiderWinStatus.className = 'text-xl text-green-400';
+                    AudioManager.stopUnfoundSoundLoop(); // Stop loop when naturally finished
                 }
 
-                // Show/hide the "Mark Found" button for the active reveal player
-                markFoundGameOverBtn.classList.toggle('hidden', isClientFoundGameOver || !amIActiveUnfound);
-                // Show/hide the "Found!" text
-                gameOverFoundText.classList.toggle('hidden', !isClientFoundGameOver);
+                DOMElements.markFoundGameOverBtn.classList.toggle('hidden', !!isClientFound || !amIActiveUnfound);
+                DOMElements.gameOverFoundText.classList.toggle('hidden', !isClientFound);
 
             } else {
-                // Handle unexpected game over state
-                gameResult.textContent = 'Game Over';
-                 gameResult.className = 'text-3xl font-semibold text-gray-400';
-                gameOverReason.textContent = 'The game ended unexpectedly.';
-                hiderWinRevealSection.classList.add('hidden');
-                 stopUnfoundSoundLoop();
+                DOMElements.gameResult.textContent = 'Game Over';
+                DOMElements.gameResult.className = 'text-3xl font-semibold text-gray-400';
+                DOMElements.gameOverReason.textContent = 'The game ended unexpectedly.';
+                DOMElements.hiderWinRevealSection.classList.add('hidden');
+                AudioManager.stopUnfoundSoundLoop();
             }
-            playAgainBtn.classList.remove('hidden'); // Show Play Again button
-            break;
+            DOMElements.playAgainBtn.classList.remove('hidden');
+        },
 
-        default:
-            // Handle unknown game state by resetting to join view
-            console.warn("Unknown game state received:", state.gameState);
-            stopUnfoundSoundLoop();
-            showView('join-view');
-            break;
-    }
-});
+        /** Shows an error message in a specified element, optionally clearing after delay. */
+        showError: function(message, element, clearDelayMs = 5000) {
+            if (element) {
+                element.textContent = message;
+                 // Clear the error message after a delay if specified
+                 if (message && clearDelayMs > 0) {
+                     setTimeout(() => {
+                         // Check if the message is still the same before clearing
+                         if (element.textContent === message) {
+                             element.textContent = '';
+                         }
+                     }, clearDelayMs);
+                 }
+            } else {
+                // Fallback alert if no specific element provided for current view
+                console.error("Error Display Element not found for message:", message);
+                alert(`Error: ${message}`); // Use alert as last resort
+            }
+        },
 
+        /** Clears the text content of an error element immediately. */
+        clearError: function(element) {
+             if (element) {
+                 element.textContent = '';
+             }
+        },
 
-// Handle pre-seek countdown updates from the server
-socket.on('preSeekCountdown', (value) => {
-    console.log('Countdown:', value);
-    if (currentRoomState?.gameState === 'Hiding') {
-        hidingCountdown.textContent = value > 0 ? value : "0"; // Display countdown value (or 0)
-        // Add visual pulse effect for the last few seconds
-        hidingCountdown.classList.toggle('pulse', value <= 3 && value > 0);
-        hidingCountdown.classList.toggle('text-red-600', value <= 3 && value > 0);
-    }
-});
+        /** Updates UI immediately on user action for better responsiveness. */
+        handleConfirmHiddenClick: function() {
+             DOMElements.confirmHiddenBtn.classList.add('hidden');
+             DOMElements.hidingConfirmedText.classList.remove('hidden');
+        },
 
-// Listen for the animal sound trigger from the server
-socket.on('playSound', (profile) => {
-    // Only play sound if this client is not yet found
-    if (currentRoomState?.players[myPlayerId] && !currentRoomState.players[myPlayerId].isFound) {
-        console.log('Received playSound request:', profile);
-        playAudio(profile.soundURL, 'seeking'); // Play the assigned animal sound
-    } else {
-         console.log('Received playSound request but I am already found. Ignoring.');
-    }
-});
+        handleMarkSelfFoundClick: function() {
+             DOMElements.hiddenDeviceUi.classList.add('hidden');
+             DOMElements.alreadyFoundText.classList.remove('hidden');
+             AudioManager.play(SOUND_URLS.FOUND, 'found'); // Play found sound locally immediately
+        },
 
-// Listen for the unfound sound trigger (sent only to the active player during Hider reveal)
-socket.on('becomeActiveUnfound', (profile) => {
-    console.log('Received becomeActiveUnfound request:', profile);
-    stopAllSeekingSounds(); // Stop any lingering seeking sounds first
-    // Ensure the "Mark Found" button is visible and "Found" text is hidden for this player
-    if (markFoundGameOverBtn) markFoundGameOverBtn.classList.remove('hidden');
-    if (gameOverFoundText) gameOverFoundText.classList.add('hidden');
-    startUnfoundSoundLoop(profile.soundURL); // Start looping the unfound sound
-});
+        handleMarkFoundGameOverClick: function() {
+             AudioManager.stopUnfoundSoundLoop(); // Stop the reveal sound immediately
+             DOMElements.markFoundGameOverBtn.classList.add('hidden');
+             DOMElements.gameOverFoundText.classList.remove('hidden');
+             AudioManager.play(SOUND_URLS.FAIL, 'fail'); // Play the 'fail' sound
+        }
+    };
 
-// Listen for the victory melody trigger (sent to all players on Seeker win)
-socket.on('playVictoryMelody', () => {
-    console.log('Received playVictoryMelody request.');
-    stopAllSeekingSounds(); // Stop any lingering seeking sounds first
-    playAudio('/sounds/victory.mp3', 'victory'); // Play the victory sound
-});
+    // =========================================================================
+    // == Socket Client
+    // =========================================================================
+    const SocketClient = {
+        socket: null,
 
+        /** Initialize Socket.IO connection and base event listeners. */
+        init: function() {
+            console.log("SocketClient: Initializing connection...");
+            // Ensure Socket.IO library is loaded
+            if (typeof io === 'undefined') {
+                 console.error("Socket.IO client library not found. Ensure it's included in the HTML.");
+                 UIManager.showError("Connection library failed to load. Please refresh.", DOMElements.joinError);
+                 return;
+            }
+            this.socket = io();
+            this.setupEventListeners();
+        },
 
-// === Event Listeners ===
+        /** Set up listeners for core Socket.IO events and custom game events. */
+        setupEventListeners: function() {
+            this.socket.on('connect', this.handleConnect.bind(this));
+            this.socket.on('disconnect', this.handleDisconnect.bind(this));
+            this.socket.on('errorMsg', this.handleErrorMsg.bind(this));
+            this.socket.on('updateState', this.handleUpdateState.bind(this));
+            this.socket.on('preSeekCountdown', this.handlePreSeekCountdown.bind(this));
+            this.socket.on('playSound', this.handlePlaySound.bind(this));
+            this.socket.on('becomeActiveUnfound', this.handleBecomeActiveUnfound.bind(this));
+            this.socket.on('playVictoryMelody', this.handlePlayVictoryMelody.bind(this));
+        },
 
-// Use Tone.start() for reliable audio context unlocking on first user interaction
-audioEnableOverlay.addEventListener('click', () => {
-    console.log("Audio enable overlay clicked.");
+        // --- Event Handlers ---
 
-    // --- UI Update First ---
-    audioEnableOverlay.classList.add('hidden');
-    audioEnableOverlay.classList.remove('active', 'flex');
-    showView('join-view'); // Show the initial join view
-    console.log("Overlay hidden, join view shown.");
-    // --- End UI Update ---
+        handleConnect: function() {
+            console.log('Connected to server. Socket ID:', this.socket.id);
+            myPlayerId = this.socket.id;
+            // If not already in a game (e.g., fresh load or after disconnect error), ensure Join view
+            if (!currentRoomState) {
+                 UIManager.showView(VIEW_IDS.JOIN);
+            }
+        },
 
-    // --- Attempt Audio Context Start ---
-    if (typeof Tone === 'undefined') {
-         console.error("Tone.js library not loaded. Cannot start audio context.");
-         return;
-    }
-    // Try to start/resume the AudioContext if it's not already running
-    if (Tone.context.state !== 'running') {
-        console.log("Attempting Tone.start()...");
-        Tone.start().then(() => {
-            console.log("Tone.start() successful. Audio context is running.");
-            ensureTransportRunning(); // Ensure Tone.Transport is started after context is running
-        }).catch(e => {
-            console.error("Tone.start() failed:", e);
-            // Warn user that audio might not work
-            console.warn("Tone.start() failed. Subsequent audio playback might fail.");
+        handleDisconnect: function(reason) {
+            console.warn('Disconnected from server:', reason);
+            AudioManager.resetState(); // Stop sounds, clear audio state
+
+            // Use client-side GAME_STATE constants
+            const wasInGame = currentRoomState && currentRoomState.gameState !== GAME_STATE.WAITING && currentRoomState.gameState !== GAME_STATE.GAME_OVER;
+
+            // Clear local state and timers
+            currentRoomState = null;
+            myPlayerId = null;
+            if (seekTimerInterval) clearInterval(seekTimerInterval);
+            seekTimerInterval = null;
+
+            // Show Join view and potentially an error message
+            UIManager.showView(VIEW_IDS.JOIN);
+            if (wasInGame && reason !== 'io client disconnect') { // Don't show error for manual leave
+                 UIManager.showError('Connection lost. Please rejoin or create a new game.', DOMElements.joinError);
+            } else {
+                 UIManager.clearError(DOMElements.joinError); // Clear any previous errors on normal disconnect/leave
+            }
+        },
+
+        handleErrorMsg: function(message) {
+            console.error('Server Error Message:', message);
+            // Determine the correct error element based on the active view
+            let errorElement = null;
+            switch (activeViewId) {
+                case VIEW_IDS.JOIN:         errorElement = DOMElements.joinError; break;
+                case VIEW_IDS.WAITING_ROOM: errorElement = DOMElements.startError; break;
+                // Add cases for other views if they need specific error displays
+                default: console.warn("No specific error element found for active view:", activeViewId);
+            }
+             UIManager.showError(message, errorElement); // UIManager handles fallback alert
+        },
+
+        handleUpdateState: function(state) {
+            console.log('Received state update:', state.gameState, state);
+            const previousState = currentRoomState?.gameState;
+            currentRoomState = state; // Update local state *first*
+
+            // --- Audio Preloading ---
+            // Use client-side GAME_STATE constants
+            if ((state.gameState === GAME_STATE.WAITING || state.gameState === GAME_STATE.HIDING) && !soundsPreloaded && audioContextStarted) {
+                AudioManager.preloadGameSounds(state.players);
+            }
+
+             // --- Reset Audio on New Game ---
+             // Use client-side GAME_STATE constants
+             if (state.gameState === GAME_STATE.WAITING && previousState === GAME_STATE.GAME_OVER) {
+                 AudioManager.resetState();
+                 if (audioContextStarted) { // Preload immediately if possible
+                      AudioManager.preloadGameSounds(state.players);
+                 }
+             }
+
+            // --- Clear Intervals/Stop Sounds Based on State Transitions ---
+            // Use client-side GAME_STATE constant
+            if (state.gameState !== GAME_STATE.SEEKING && seekTimerInterval) {
+                clearInterval(seekTimerInterval);
+                seekTimerInterval = null;
+            }
+            // Stop unfound loop unless specifically active
+            // Use client-side GAME_STATE and WINNER_TYPE constants
+            if (!(state.gameState === GAME_STATE.GAME_OVER && state.winner === WINNER_TYPE.HIDER && state.activeUnfoundPlayerId === myPlayerId)) {
+                 AudioManager.stopUnfoundSoundLoop();
+            }
+            // Stop seeking sounds when leaving Seeking state
+            // Use client-side GAME_STATE constant
+            if (previousState === GAME_STATE.SEEKING && state.gameState !== GAME_STATE.SEEKING) {
+                AudioManager.stopAllSeekingSounds();
+            }
+
+            // --- Update UI Based on New Game State ---
+            // Use client-side GAME_STATE constants
+            switch (state.gameState) {
+                case GAME_STATE.WAITING:
+                    UIManager.showView(VIEW_IDS.WAITING_ROOM);
+                    UIManager.updateWaitingRoomUI(state);
+                    break;
+                case GAME_STATE.HIDING:
+                    UIManager.showView(VIEW_IDS.HIDING);
+                    UIManager.updateHidingPhaseUI(state);
+                    break;
+                case GAME_STATE.SEEKING:
+                    UIManager.showView(VIEW_IDS.SEEKING);
+                    UIManager.updateSeekingPhaseUI(state);
+                    break;
+                case GAME_STATE.GAME_OVER:
+                    UIManager.showView(VIEW_IDS.GAME_OVER);
+                    UIManager.updateGameOverUI(state);
+                    break;
+                default:
+                    console.warn("Unknown game state received:", state.gameState, ". Resetting to Join view.");
+                    AudioManager.stopUnfoundSoundLoop();
+                    UIManager.showView(VIEW_IDS.JOIN);
+                    break;
+            }
+        },
+
+        handlePreSeekCountdown: function(value) {
+             UIManager.updatePreSeekCountdown(value);
+        },
+
+        handlePlaySound: function(profile) {
+            if (currentRoomState?.players[myPlayerId] && !currentRoomState.players[myPlayerId].isFound) {
+                AudioManager.play(profile.soundURL, 'seeking');
+            }
+        },
+
+        handleBecomeActiveUnfound: function(profile) {
+            console.log('Received becomeActiveUnfound request:', profile.soundURL);
+            AudioManager.stopAllSeekingSounds(); // Ensure seeking sounds stopped
+            // UI update for button visibility handled by updateGameOverUI via state update
+            AudioManager.startUnfoundSoundLoop(profile.soundURL);
+        },
+
+        handlePlayVictoryMelody: function() {
+            console.log('Received playVictoryMelody request.');
+            AudioManager.stopAllSeekingSounds();
+            AudioManager.stopUnfoundSoundLoop();
+            AudioManager.play(SOUND_URLS.VICTORY, 'victory');
+        },
+
+        // --- Emitters ---
+
+        emitJoinRoom: function(code) {
+            this.socket.emit('joinRoom', code);
+        },
+        emitCreateRoom: function() {
+            this.socket.emit('createRoom');
+        },
+         emitLeaveRoom: function() {
+             this.socket.emit('leaveRoom');
+         },
+        emitUpdateSettings: function(settings) {
+            this.socket.emit('updateSettings', settings);
+        },
+        emitStartHiding: function() {
+            this.socket.emit('startHiding');
+        },
+        emitConfirmHidden: function() {
+            this.socket.emit('confirmHidden');
+        },
+        emitMarkSelfFound: function() {
+            this.socket.emit('markSelfFound');
+        },
+        emitRequestPlayAgain: function() {
+            this.socket.emit('requestPlayAgain');
+        }
+    };
+
+    // =========================================================================
+    // == Main Application Logic & Event Listeners
+    // =========================================================================
+    function setupUIEventListeners() {
+        console.log("Setting up UI event listeners.");
+
+        // --- Modal ---
+        DOMElements.howToPlayBtn.addEventListener('click', () => {
+            UIManager.showView(VIEW_IDS.HOW_TO_PLAY);
         });
-    } else {
-         console.log("Audio context already running.");
-         ensureTransportRunning(); // Ensure transport is running if context was already active
+        DOMElements.closeHowToPlayBtn.addEventListener('click', () => {
+            // Return to the view that was active before opening the modal
+            UIManager.showView(activeViewId === VIEW_IDS.HOW_TO_PLAY ? VIEW_IDS.JOIN : activeViewId);
+        });
+
+        // --- Join View ---
+        DOMElements.joinRoomBtn.addEventListener('click', () => {
+            AudioManager.attemptStart(); // Crucial: Start audio on first interaction
+            const code = DOMElements.roomCodeInput.value.trim().toUpperCase();
+            // Use client-side ROOM_CODE_LENGTH constant
+            if (code.length === ROOM_CODE_LENGTH) {
+                UIManager.clearError(DOMElements.joinError);
+                SocketClient.emitJoinRoom(code);
+            } else {
+                UIManager.showError(`Room code must be ${ROOM_CODE_LENGTH} characters.`, DOMElements.joinError);
+            }
+        });
+
+        DOMElements.createRoomBtn.addEventListener('click', () => {
+            AudioManager.attemptStart(); // Crucial: Start audio on first interaction
+            UIManager.clearError(DOMElements.joinError);
+            SocketClient.emitCreateRoom();
+        });
+
+         // Input validation for room code
+         DOMElements.roomCodeInput.addEventListener('input', () => {
+             DOMElements.roomCodeInput.value = DOMElements.roomCodeInput.value.toUpperCase().replace(/[^A-Z]/g, '');
+             // Use client-side ROOM_CODE_LENGTH constant
+             if (DOMElements.roomCodeInput.value.length > ROOM_CODE_LENGTH) {
+                 DOMElements.roomCodeInput.value = DOMElements.roomCodeInput.value.slice(0, ROOM_CODE_LENGTH);
+             }
+         });
+
+        // --- Waiting Room View ---
+        DOMElements.updateSettingsBtn.addEventListener('click', () => {
+            const timeLimit = parseInt(DOMElements.seekTimeLimitInput.value, 10);
+            const soundPlays = parseInt(DOMElements.soundPlaysInput.value, 10);
+
+            // Basic client-side validation using client-side constants
+            let errorMsg = '';
+            if (isNaN(timeLimit) || timeLimit < MIN_SEEK_TIME_LIMIT_S || timeLimit > MAX_SEEK_TIME_LIMIT_S) {
+                 errorMsg = `Time limit must be ${MIN_SEEK_TIME_LIMIT_S}-${MAX_SEEK_TIME_LIMIT_S}s.`;
+            } else if (isNaN(soundPlays) || soundPlays < MIN_SOUND_PLAYS || soundPlays > MAX_SOUND_PLAYS) {
+                 errorMsg = `Sounds/phone must be ${MIN_SOUND_PLAYS}-${MAX_SOUND_PLAYS}.`;
+            }
+
+            if (errorMsg) {
+                UIManager.showError(errorMsg, DOMElements.startError);
+            } else {
+                UIManager.clearError(DOMElements.startError);
+                SocketClient.emitUpdateSettings({
+                    seekTimeLimit: timeLimit,
+                    soundPlaysPerPlayer: soundPlays
+                });
+            }
+        });
+
+        DOMElements.startHidingBtn.addEventListener('click', () => {
+            UIManager.clearError(DOMElements.startError);
+            SocketClient.emitStartHiding();
+        });
+
+        DOMElements.backToJoinBtn.addEventListener('click', () => {
+            console.log("Back button clicked.");
+            SocketClient.emitLeaveRoom(); // Tell server we are leaving
+            UIManager.showView(VIEW_IDS.JOIN); // Immediately switch view locally
+            // Clear local state to prevent issues
+            currentRoomState = null;
+            // Keep player ID if socket still connected, otherwise null
+            myPlayerId = SocketClient.socket?.id || null;
+            if (seekTimerInterval) clearInterval(seekTimerInterval); // Clear timer if running
+            seekTimerInterval = null;
+            AudioManager.resetState(); // Reset audio state as well
+        });
+
+        // --- Hiding Phase View ---
+        DOMElements.confirmHiddenBtn.addEventListener('click', () => {
+            UIManager.handleConfirmHiddenClick(); // Immediate UI update
+            SocketClient.emitConfirmHidden(); // Inform server
+        });
+
+        // --- Seeking Phase View ---
+        DOMElements.markSelfFoundBtn.addEventListener('click', () => {
+            UIManager.handleMarkSelfFoundClick(); // Immediate UI update + sound
+            SocketClient.emitMarkSelfFound(); // Inform server
+        });
+
+        // --- Game Over View ---
+        DOMElements.markFoundGameOverBtn.addEventListener('click', () => {
+            UIManager.handleMarkFoundGameOverClick(); // Immediate UI update + sound
+            SocketClient.emitMarkSelfFound(); // Inform server (same event)
+        });
+
+        DOMElements.playAgainBtn.addEventListener('click', () => {
+            AudioManager.resetState(); // Reset audio state locally first
+            SocketClient.emitRequestPlayAgain(); // Request server reset
+        });
     }
-});
 
-
-// Show/Hide How to Play modal
-howToPlayBtn.addEventListener('click', () => {
-    howToPlayModal.classList.remove('hidden');
-    howToPlayModal.classList.add('flex');
-});
-
-closeHowToPlayBtn.addEventListener('click', () => {
-    howToPlayModal.classList.add('hidden');
-    howToPlayModal.classList.remove('flex');
-});
-
-// Join Room button
-joinRoomBtn.addEventListener('click', () => {
-    const code = roomCodeInput.value.trim().toUpperCase();
-    if (code.length === 5) {
-        joinError.textContent = ''; // Clear previous errors
-        socket.emit('joinRoom', code); // Send join request to server
-    } else {
-        joinError.textContent = 'Room code must be 5 characters.';
+    // --- App Initialization ---
+    function initializeApp() {
+        console.log("Hide 'n' Seek: Initializing application...");
+        UIManager.init(); // Cache DOM elements first
+        SocketClient.init(); // Start socket connection
+        setupUIEventListeners(); // Setup button clicks etc.
+        UIManager.showView(VIEW_IDS.JOIN); // Start at the join view
+        console.log("Application initialized. Waiting for server connection and user interaction.");
     }
-});
 
-// Create Room button
-createRoomBtn.addEventListener('click', () => {
-    joinError.textContent = ''; // Clear previous errors
-    socket.emit('createRoom'); // Send create request to server
-});
+    // Start the application once the DOM is fully loaded
+    document.addEventListener('DOMContentLoaded', initializeApp);
 
-// Configure Game button (Hider only)
-configureGameBtn.addEventListener('click', () => {
-    const timeLimit = parseInt(seekTimeLimitInput.value, 10);
-    if (!isNaN(timeLimit) && timeLimit >= 15 && timeLimit <= 600) {
-        startError.textContent = ''; // Clear previous errors
-        socket.emit('configureGame', { seekTimeLimit: timeLimit }); // Send config update
-    } else {
-         startError.textContent = 'Time limit must be between 15 and 600 seconds.';
-    }
-});
+})(); // End IIFE
 
-// Start Hiding button (Hider only)
-startHidingBtn.addEventListener('click', () => {
-    startError.textContent = ''; // Clear previous errors
-    socket.emit('startHiding'); // Send request to start hiding phase
-});
-
-// Confirm Hidden button (Hiding phase)
-confirmHiddenBtn.addEventListener('click', () => {
-    // Immediately update UI for responsiveness (server will confirm via state update)
-    confirmHiddenBtn.classList.add('hidden');
-    hidingConfirmedText.classList.remove('hidden');
-    socket.emit('confirmHidden'); // Inform server this player is hidden
-});
-
-// Mark Self Found button (Seeking phase)
-markSelfFoundBtn.addEventListener('click', () => {
-    // Immediately update UI
-    hiddenDeviceUi.classList.add('hidden');
-    alreadyFoundText.classList.remove('hidden');
-    socket.emit('markSelfFound'); // Inform server this player was found
-});
-
-// Mark Found button (Game Over Hider reveal)
-markFoundGameOverBtn.addEventListener('click', () => {
-    console.log("Mark Found (Game Over) button clicked.");
-    stopUnfoundSoundLoop(); // Stop the reveal sound immediately
-    // Immediately update UI
-    markFoundGameOverBtn.classList.add('hidden');
-    gameOverFoundText.classList.remove('hidden');
-    socket.emit('markSelfFound'); // Inform server this player was found
-});
-
-// Play Again button (Game Over)
-playAgainBtn.addEventListener('click', () => {
-    stopUnfoundSoundLoop(); // Stop any reveal sounds
-    // Reset audio state flags and cache
-    soundsPreloaded = false;
-    Object.values(audioPlayers).forEach(player => player?.dispose());
-    audioPlayers = {};
-    knownAnimalSoundURLs = [];
-    socket.emit('requestPlayAgain'); // Send request to server to reset the game
-});
-
-// Initial setup
-console.log("Client script loaded. Using Tone.Player with preloading strategy.");
-// Audio overlay is shown initially via CSS/HTML 'active' class

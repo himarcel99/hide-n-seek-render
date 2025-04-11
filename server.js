@@ -1,746 +1,871 @@
-// Import necessary modules
+/**
+ * server.js (Refactored)
+ *
+ * Main server file for the Hide 'n' Seek web application.
+ * Handles game logic, room management, and WebSocket communication using Socket.IO.
+ * Refactored for better structure, maintainability, and clarity.
+ */
+
+// --- Core Modules ---
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
 const path = require('path');
 
-// Initialize Express app and HTTP server
-const app = express();
-const server = http.createServer(app);
-// Initialize Socket.IO server
-const io = new Server(server);
+// =============================================================================
+// == Constants & Configuration
+// =============================================================================
 
-// Define the port, using environment variable or default to 3000
 const PORT = process.env.PORT || 3000;
+const PUBLIC_DIR = path.join(__dirname, 'public'); // Serve static files from here
+const ROOM_CODE_LENGTH = 5;
+const ROOM_CODE_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+const MIN_PLAYERS_TO_START = 2;
 
-// Serve static files (like index.html, client.js, css, sounds) from the 'public' directory
-// IMPORTANT: Your index.html, client.js, and sounds folder must be inside a 'public' folder
-// in the same directory as server.js for this to work.
-app.use(express.static(path.join(__dirname, 'public')));
+// Game Timing & Settings Defaults
+const DEFAULT_SEEK_TIME_LIMIT_S = 120;
+const MIN_SEEK_TIME_LIMIT_S = 15;
+const MAX_SEEK_TIME_LIMIT_S = 600;
+const DEFAULT_SOUND_PLAYS_PER_PLAYER = 6;
+const MIN_SOUND_PLAYS = 1;
+const MAX_SOUND_PLAYS = 20; // Increased limit
+const PRE_SEEK_COUNTDOWN_S = 10;
+const MIN_SOUND_DELAY_MS = 1000; // Minimum delay between any two sounds scheduled
+const CHECK_INTERVAL_WHEN_NO_SOUNDS_MS = 1500; // How often to check game state if no sounds are eligible
 
-// --- Define Sound File Paths ---
-// Arrays holding the relative paths to the sound files within the 'public' directory
-const baseAnimalSounds = [
-    '/sounds/chicken.mp3', '/sounds/horse.mp3', '/sounds/cow.mp3', '/sounds/sheep.mp3',
-    '/sounds/pig.mp3', '/sounds/cat.mp3', '/sounds/dog.mp3', '/sounds/bird.mp3'
+// Game States
+const GAME_STATE = Object.freeze({
+    WAITING: 'Waiting',
+    HIDING: 'Hiding',
+    SEEKING: 'Seeking',
+    GAME_OVER: 'GameOver',
+});
+
+// Player Roles
+const PLAYER_ROLE = Object.freeze({
+    HIDER: 'Hider',
+    SEEKER: 'Seeker',
+});
+
+// Winner Types
+const WINNER_TYPE = Object.freeze({
+    HIDER: 'Hider',
+    SEEKERS: 'Seekers',
+});
+
+// Sound Files (Ensure these exist in the public/sounds directory)
+// NOTE: It's crucial that baseAnimalSounds and baseUnfoundSounds have the same number of elements.
+const BASE_ANIMAL_SOUNDS = [
+    '/sounds/cat.mp3', '/sounds/chicken.mp3', '/sounds/cow.mp3', '/sounds/dog.mp3',
+    '/sounds/donkey.mp3', '/sounds/horse.mp3', '/sounds/sheep.mp3', '/sounds/bird.mp3'
 ];
-const baseUnfoundSounds = [
+const BASE_UNFOUND_SOUNDS = [
     '/sounds/unfound1.mp3', '/sounds/unfound2.mp3', '/sounds/unfound3.mp3', '/sounds/unfound4.mp3',
     '/sounds/unfound5.mp3', '/sounds/unfound6.mp3', '/sounds/unfound7.mp3', '/sounds/unfound8.mp3'
 ];
-// Warning if sound arrays have different lengths, as they are paired
-if (baseAnimalSounds.length !== baseUnfoundSounds.length) {
-    console.warn("Warning: Number of animal sounds does not match number of unfound sounds.");
+
+// Validate sound configuration on startup
+if (BASE_ANIMAL_SOUNDS.length !== BASE_UNFOUND_SOUNDS.length) {
+    console.warn("Configuration Warning: The number of animal sounds does not match the number of unfound sounds. Please ensure corresponding sounds exist.");
 }
-const numUniqueSounds = baseAnimalSounds.length;
+const NUM_UNIQUE_SOUND_PAIRS = Math.min(BASE_ANIMAL_SOUNDS.length, BASE_UNFOUND_SOUNDS.length);
+if (NUM_UNIQUE_SOUND_PAIRS === 0) {
+    console.error("CRITICAL ERROR: No sound pairs defined in BASE_ANIMAL_SOUNDS/BASE_UNFOUND_SOUNDS. Sound assignment will fail.");
+    // Consider exiting the process if sounds are critical
+    // process.exit(1);
+} else if (NUM_UNIQUE_SOUND_PAIRS < 8) { // Example threshold
+    console.warn(`Warning: Only ${NUM_UNIQUE_SOUND_PAIRS} unique sound pairs available. Consider adding more sound files.`);
+}
 
-// In-memory store for all active game rooms and their states
-const rooms = {};
+// =============================================================================
+// == Global State
+// =============================================================================
 
+// Stores all active game rooms and their states. Key: roomCode, Value: Room instance
+const activeRooms = {};
+
+// =============================================================================
+// == Utility Functions
+// =============================================================================
 
 /**
- * Generates a unique 5-character room code using only uppercase letters.
- * Ensures the generated code is not already in use.
- * @returns {string} A unique 5-character room code.
+ * Generates a unique room code not currently present in activeRooms.
+ * @returns {string} A unique room code.
  */
-function generateRoomCode() {
+function generateUniqueRoomCode() {
     let code;
-    // Use only letters for the room code for simplicity
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    let attempts = 0;
+    const maxAttempts = 100; // Prevent infinite loop in unlikely scenario
     do {
-        code = '';
-        for (let i = 0; i < 5; i++) {
-            code += chars.charAt(Math.floor(Math.random() * chars.length));
+        if (attempts++ > maxAttempts) {
+            throw new Error("Failed to generate a unique room code after multiple attempts.");
         }
-    } while (rooms[code]); // Ensure uniqueness by checking if the code already exists
+        code = '';
+        for (let i = 0; i < ROOM_CODE_LENGTH; i++) {
+            code += ROOM_CODE_CHARS.charAt(Math.floor(Math.random() * ROOM_CODE_CHARS.length));
+        }
+    } while (activeRooms[code]); // Ensure uniqueness
     return code;
 }
 
-/**
- * Creates a safe-to-send representation of the room state for clients.
- * Omits server-internal details (like interval IDs) and includes necessary info like sound URLs and roles.
- * @param {string} roomCode - The code of the room to get the state for.
- * @returns {object | null} A filtered room state object suitable for sending to clients, or null if the room doesn't exist.
- */
-function getRoomStateForClient(roomCode) {
-    if (!rooms[roomCode]) return null; // Return null if room doesn't exist
+// =============================================================================
+// == Player Class
+// =============================================================================
+class Player {
+    constructor(id, number, role) {
+        this.id = id;
+        this.number = number;
+        this.role = role;
+        this.isReady = false; // Ready state for Hiding phase
+        this.isFound = false; // Found state for Seeking/Game Over phases
+        this.soundsPlayed = 0; // Sounds played count during Seeking phase
+        this.uniqueAnimalSoundURL = null;
+        this.uniqueUnfoundSoundURL = null;
+    }
 
-    const room = rooms[roomCode];
-    const playersForClient = {};
-    // Create a player object for the client, including sound URLs and role for preloading/UI logic
-    Object.values(room.players).forEach(p => {
-        playersForClient[p.id] = {
-            id: p.id,
-            number: p.number,
-            role: p.role, // Role is needed for client-side logic (like showing Hider controls)
-            isReady: p.isReady, // Needed for Hiding phase status
-            isFound: p.isFound, // Needed for Seeking/Game Over status
-            // Include sound URLs so the client can preload them
-            uniqueAnimalSoundURL: p.uniqueAnimalSoundURL,
-            uniqueUnfoundSoundURL: p.uniqueUnfoundSoundURL
+    /** Resets player state for a new game or phase transition. */
+    resetForNewGame() {
+        this.isReady = false;
+        this.isFound = false;
+        this.soundsPlayed = 0;
+        // Role and sounds are reassigned by the Room class
+    }
+
+    /** Resets player state specifically for the start of the seeking phase. */
+    resetForSeeking() {
+        this.isReady = false; // Clear ready status from hiding phase
+        this.soundsPlayed = 0; // Reset sounds played count
+    }
+
+    /** Returns a simplified player object safe for client transmission. */
+    getClientState() {
+        return {
+            id: this.id,
+            number: this.number,
+            role: this.role,
+            isReady: this.isReady,
+            isFound: this.isFound,
+            uniqueAnimalSoundURL: this.uniqueAnimalSoundURL,
+            uniqueUnfoundSoundURL: this.uniqueUnfoundSoundURL,
+            // Note: soundsPlayed is intentionally omitted from client state
         };
-    });
-
-    // Return the filtered state object
-    return {
-        roomCode: room.roomCode,
-        players: playersForClient, // Send filtered player details including role
-        gameState: room.gameState,
-        seekTimeLimit: room.seekTimeLimit,
-        seekStartTime: room.seekStartTime, // Needed for client-side timer display
-        winner: room.winner,
-        activeUnfoundPlayerId: room.activeUnfoundPlayerId, // Needed for Game Over reveal UI
-    };
-}
-
-/**
- * Broadcasts the current, filtered room state to all clients connected to that room.
- * @param {string} roomCode - The code of the room to update.
- */
-function broadcastUpdateState(roomCode) {
-    const state = getRoomStateForClient(roomCode); // Get the client-safe state
-    if (state) {
-        io.to(roomCode).emit('updateState', state); // Emit the 'updateState' event to the room
-        console.log(`[${roomCode}] Broadcasted state: ${state.gameState}`);
     }
 }
 
-/**
- * Clears all game-related intervals and timeouts associated with a specific room.
- * Resets related state variables. Important for stopping game loops and timers correctly.
- * @param {string} roomCode - The code of the room to clear intervals for.
- */
-function clearGameIntervals(roomCode) {
-    const room = rooms[roomCode];
-    if (!room) return; // Do nothing if room doesn't exist
-
-    // Clear any active intervals/timeouts
-    if (room.preSeekCountdownInterval) clearInterval(room.preSeekCountdownInterval);
-    if (room.seekTimerInterval) clearInterval(room.seekTimerInterval);
-    if (room.soundRotationTimeout) clearTimeout(room.soundRotationTimeout);
-
-    // Reset interval/timeout IDs and related state
-    room.preSeekCountdownInterval = null;
-    room.seekTimerInterval = null;
-    room.soundRotationTimeout = null;
-    room.activeUnfoundPlayerId = null; // Reset active player for reveal
-    room.unfoundPlayerQueue = []; // Clear reveal queue
-    room.nextPlayerIndexToPlay = 0; // Reset sound rotation index
-    console.log(`[${roomCode}] Cleared game intervals.`);
-}
-
-
-/**
- * Checks if all players in a room have been found (Seekers win condition).
- * If the condition is met, it ends the game with 'Seekers' as the winner.
- * @param {string} roomCode - The code of the room to check.
- * @returns {boolean} True if the Seekers win condition is met, false otherwise.
- */
-function checkSeekerWin(roomCode) {
-    const room = rooms[roomCode];
-    // Only check if the game is currently in the 'Seeking' state
-    if (!room || room.gameState !== 'Seeking') return false;
-
-    // Check if every player in the room has the 'isFound' flag set to true
-    const allFound = Object.values(room.players).every(p => p.isFound);
-    if (allFound) {
-        console.log(`[${roomCode}] Seekers win condition met.`);
-        endGame(roomCode, 'Seekers'); // End the game, declaring Seekers as winners
-        return true;
-    }
-    return false;
-}
-
-/**
- * Ends the current game in the specified room.
- * Sets the game state to 'GameOver', declares the winner, clears intervals,
- * and initiates the appropriate end-game sequence (reveal or victory sound).
- * @param {string} roomCode - The code of the room where the game is ending.
- * @param {'Hider' | 'Seekers'} winner - The declared winner of the game.
- */
-function endGame(roomCode, winner) {
-    const room = rooms[roomCode];
-    // Prevent ending the game multiple times or if the room doesn't exist
-    if (!room || room.gameState === 'GameOver') return;
-
-    console.log(`[${roomCode}] Game Over. Winner: ${winner}`);
-    clearGameIntervals(roomCode); // Stop all active game timers/loops
-
-    // Update game state
-    room.gameState = 'GameOver';
-    room.winner = winner;
-
-    // Trigger appropriate follow-up actions based on the winner
-    if (winner === 'Hider') {
-        startGameOverReveal(roomCode); // Start the reveal sequence for unfound phones
-    } else if (winner === 'Seekers') {
-        io.to(roomCode).emit('playVictoryMelody'); // Tell clients to play the victory sound
-        broadcastUpdateState(roomCode); // Send the final state update
-    } else {
-        // Should not happen with current logic, but broadcast state just in case
-        broadcastUpdateState(roomCode);
-    }
-}
-
-
-// --- Game Over Reveal Functions (for Hider Win) ---
-
-/**
- * Starts the Hider Win reveal sequence.
- * Creates a queue of unfound players and activates the first one.
- * @param {string} roomCode - The room where the Hider won.
- */
-function startGameOverReveal(roomCode) {
-    const room = rooms[roomCode];
-    if (!room || room.winner !== 'Hider') return; // Only proceed if Hider won
-
-    // Create a queue of IDs of players who were not found, sorted by player number
-    room.unfoundPlayerQueue = Object.values(room.players)
-        .filter(p => !p.isFound) // Filter for unfound players
-        .sort((a, b) => a.number - b.number) // Sort by player number
-        .map(p => p.id); // Get just the IDs
-
-    console.log(`[${roomCode}] Starting Hider Win reveal. Queue:`, room.unfoundPlayerQueue);
-    activateNextUnfoundPlayer(roomCode); // Activate the first player in the queue
-}
-
-/**
- * Activates the next player in the unfound queue for the Hider Win reveal.
- * Sends a message to that specific player's client telling it to start playing its "unfound" sound.
- * Updates the room state to reflect who is currently active.
- * @param {string} roomCode - The room where the reveal is happening.
- */
-function activateNextUnfoundPlayer(roomCode) {
-    const room = rooms[roomCode];
-    if (!room) return;
-
-    room.activeUnfoundPlayerId = null; // Reset the currently active player
-
-    // If the queue is empty, the reveal is over
-    if (room.unfoundPlayerQueue.length === 0) {
-        console.log(`[${roomCode}] Reveal queue empty or finished.`);
-        broadcastUpdateState(roomCode); // Update state one last time
-        return;
+// =============================================================================
+// == Room Class
+// =============================================================================
+class Room {
+    constructor(roomCode, ioInstance) {
+        this.roomCode = roomCode;
+        this.io = ioInstance; // Store io instance for broadcasting within the room
+        this.players = {}; // Key: socket.id, Value: Player instance
+        this.gameState = GAME_STATE.WAITING;
+        this.seekTimeLimit = DEFAULT_SEEK_TIME_LIMIT_S;
+        this.soundPlaysPerPlayer = DEFAULT_SOUND_PLAYS_PER_PLAYER;
+        this.seekTimerInterval = null;
+        this.seekStartTime = null;
+        this.winner = null;
+        this.preSeekCountdownInterval = null;
+        this.preSeekCountdownValue = PRE_SEEK_COUNTDOWN_S;
+        this.soundRotationTimeout = null;
+        this.nextPlayerIndexToPlay = 0; // Index for round-robin sound rotation among eligible players
+        this.assignedAnimalSounds = new Set(); // Track used sounds in this room
+        this.assignedUnfoundSounds = new Set();
+        this.unfoundPlayerQueue = []; // For Hider win reveal sequence
+        this.activeUnfoundPlayerId = null; // Tracks who is playing sound in reveal
     }
 
-    // Get the next player ID from the front of the queue
-    const nextPlayerId = room.unfoundPlayerQueue.shift();
-    room.activeUnfoundPlayerId = nextPlayerId; // Set this player as active
+    // --- Player Management ---
 
-    const player = room.players[nextPlayerId];
-    // Check if player exists and has an assigned unfound sound URL
-    if (player && player.uniqueUnfoundSoundURL) {
-        // Emit 'becomeActiveUnfound' only to the specific player's socket
-        io.to(nextPlayerId).emit('becomeActiveUnfound', { soundURL: player.uniqueUnfoundSoundURL });
-        console.log(`[${roomCode}] Activating player ${player.number} (${nextPlayerId}) for reveal with sound ${player.uniqueUnfoundSoundURL}.`);
-    } else {
-        // If player or sound is missing (shouldn't normally happen), log it and skip to the next
-        console.log(`[${roomCode}] Player ${nextPlayerId} or their unfound sound not found during reveal activation. Skipping.`);
-        activateNextUnfoundPlayer(roomCode); // Immediately try the next player
-        return; // Return here to avoid broadcasting state unnecessarily for the skipped player
-    }
-
-    broadcastUpdateState(roomCode); // Update all clients with the new active player
-}
-
-// --- Hiding Phase Functions ---
-
-/**
- * Starts the 10-second countdown before the Seeking phase begins.
- * Emits 'preSeekCountdown' events to all clients in the room every second.
- * @param {string} roomCode - The room where the countdown should start.
- */
-function startPreSeekCountdown(roomCode) {
-    const room = rooms[roomCode];
-    // Prevent starting multiple countdowns
-    if (!room || room.preSeekCountdownInterval) return;
-
-    console.log(`[${roomCode}] Starting pre-seek countdown.`);
-    room.preSeekCountdownValue = 10; // Start countdown from 10
-    io.to(roomCode).emit('preSeekCountdown', room.preSeekCountdownValue); // Emit initial value
-
-    // Set up an interval to decrement and emit the countdown value every second
-    room.preSeekCountdownInterval = setInterval(() => {
-        room.preSeekCountdownValue--;
-        io.to(roomCode).emit('preSeekCountdown', room.preSeekCountdownValue);
-
-        // When countdown reaches 0, clear the interval and start the Seeking phase
-        if (room.preSeekCountdownValue <= 0) {
-            clearInterval(room.preSeekCountdownInterval);
-            room.preSeekCountdownInterval = null;
-            startSeekingPhase(roomCode); // Transition to the next phase
+    addPlayer(socket) {
+        if (this.gameState !== GAME_STATE.WAITING) {
+            throw new Error("Cannot join room: Game has already started.");
         }
-    }, 1000);
-}
+        if (this.players[socket.id]) {
+             throw new Error("Cannot join room: You are already in this room.");
+        }
 
-// --- Seeking Phase Functions ---
+        const playerNumber = Object.keys(this.players).length + 1;
+        const role = (playerNumber === 1) ? PLAYER_ROLE.HIDER : PLAYER_ROLE.SEEKER;
+        const newPlayer = new Player(socket.id, playerNumber, role);
 
-/**
- * Initiates the Seeking Phase for the specified room.
- * Sets the game state, records the start time, calculates sound delay,
- * starts the main seek timer, and schedules the very first sound to play after a delay.
- * @param {string} roomCode - The room where the seeking phase should start.
- */
-function startSeekingPhase(roomCode) {
-    const room = rooms[roomCode];
-    // Prevent starting the phase multiple times or if the room doesn't exist
-    if (!room || room.gameState === 'Seeking') return;
+        this._assignUniqueSounds(newPlayer); // Assign sounds internally
+        this.players[socket.id] = newPlayer;
+        socket.join(this.roomCode);
 
-    console.log(`[${roomCode}] Starting Seeking Phase.`);
-    room.gameState = 'Seeking';
-    room.seekStartTime = Date.now(); // Record the exact start time
-    room.nextPlayerIndexToPlay = 0; // Reset sound rotation index
-    // Reset player 'isReady' flags (used during Hiding phase)
-    Object.values(room.players).forEach(p => p.isReady = false);
-
-    // Calculate Sound Delay based on time limit, player count, and desired plays per player
-    const numPlayers = Object.keys(room.players).length;
-    const playsPerPlayer = 6; // Target number of times each player's sound should play during the game
-    let calculatedDelayMs = 5000; // Default delay
-    if (numPlayers > 0 && playsPerPlayer > 0) {
-        // Distribute total time among total plays, giving delay between each play
-        calculatedDelayMs = (room.seekTimeLimit * 1000) / (numPlayers * playsPerPlayer);
+        console.log(`[${this.roomCode}] P${playerNumber} (${socket.id}, ${role}) joined. Sounds: A=${newPlayer.uniqueAnimalSoundURL}, U=${newPlayer.uniqueUnfoundSoundURL}`);
+        this.broadcastUpdateState();
+        return newPlayer;
     }
-    // Ensure delay is at least 1 second and round it
-    room.soundDelay = Math.max(1000, Math.round(calculatedDelayMs));
-    console.log(`[${roomCode}] Calculated sound delay: ${room.soundDelay}ms`);
 
-    startSeekTimer(roomCode); // Start the timer that checks for Hider win condition (time runs out)
+    removePlayer(socketId) {
+        const disconnectedPlayer = this.players[socketId];
+        if (!disconnectedPlayer) return false; // Player wasn't in this room
 
-    // Schedule the FIRST sound after an initial 10-second grace period
-    console.log(`[${roomCode}] Scheduling first sound in 10 seconds.`);
-    if (room.soundRotationTimeout) clearTimeout(room.soundRotationTimeout); // Clear any previous timeout
-    room.soundRotationTimeout = setTimeout(() => {
-        scheduleNextSound(roomCode); // Start the sound rotation logic
-    }, 10000); // 10-second delay before the first sound
+        console.log(`[${this.roomCode}] P${disconnectedPlayer.number} (${socketId}, ${disconnectedPlayer.role}) disconnected/left.`);
 
-    broadcastUpdateState(roomCode); // Inform clients that the Seeking phase has begun
-}
+        // Store info before removing
+        const wasHider = disconnectedPlayer.role === PLAYER_ROLE.HIDER;
+        const wasActiveUnfound = socketId === this.activeUnfoundPlayerId;
+        const wasInSeeking = this.gameState === GAME_STATE.SEEKING;
+        const wasInHiding = this.gameState === GAME_STATE.HIDING;
+        const wasInGameOverReveal = this.gameState === GAME_STATE.GAME_OVER && this.winner === WINNER_TYPE.HIDER;
 
-/**
- * Starts the main timer for the Seeking phase.
- * This timer checks every second if the time limit has been reached.
- * If time runs out, it ends the game with the Hider as the winner.
- * @param {string} roomCode - The room where the timer should start.
- */
-function startSeekTimer(roomCode) {
-    const room = rooms[roomCode];
-    // Prevent starting multiple timers
-    if (!room || room.seekTimerInterval) return;
+        // Make player's sounds available again
+        if (disconnectedPlayer.uniqueAnimalSoundURL) this.assignedAnimalSounds.delete(disconnectedPlayer.uniqueAnimalSoundURL);
+        if (disconnectedPlayer.uniqueUnfoundSoundURL) this.assignedUnfoundSounds.delete(disconnectedPlayer.uniqueUnfoundSoundURL);
 
-    console.log(`[${roomCode}] Seek timer started (${room.seekTimeLimit}s).`);
-    // Set up an interval to check the elapsed time every second
-    room.seekTimerInterval = setInterval(() => {
-        if (room.gameState === 'Seeking') {
-            const elapsed = (Date.now() - room.seekStartTime) / 1000; // Calculate elapsed time in seconds
-            const remaining = room.seekTimeLimit - elapsed;
-            // If remaining time is zero or less, the Hider wins
-            if (remaining <= 0) {
-                console.log(`[${roomCode}] Time limit reached. Hider wins.`);
-                endGame(roomCode, 'Hider'); // End the game
+        // Remove player from room state
+        delete this.players[socketId];
+
+        // --- Adjust Game/Room State ---
+
+        // If room is now empty, signal for deletion
+        if (this.isEmpty()) {
+            console.log(`[${this.roomCode}] Room empty after disconnect.`);
+            this.clearGameIntervals(); // Clean up intervals before deletion
+            return true; // Indicate room should be deleted
+        }
+
+        // Handle state adjustments based on when the player left
+        if (this.gameState === GAME_STATE.WAITING) {
+            if (wasHider) this._promoteNewHider();
+            this.broadcastUpdateState();
+        } else if (wasInHiding) {
+            if (this._checkAllRemainingReady() && !this.preSeekCountdownInterval) {
+                console.log(`[${this.roomCode}] Disconnect during Hiding triggered readiness. Starting countdown.`);
+                this.startPreSeekCountdown();
+            } else {
+                this.broadcastUpdateState();
+            }
+        } else if (wasInSeeking) {
+            if (wasHider) {
+                console.log(`[${this.roomCode}] Hider disconnected during Seeking. Seekers win.`);
+                this.endGame(WINNER_TYPE.SEEKERS);
+            } else {
+                // If a Seeker disconnected, check win condition again
+                if (!this.checkSeekerWin()) {
+                    this.broadcastUpdateState(); // Game continues, just update state
+                }
+            }
+        } else if (wasInGameOverReveal) {
+            // Remove player from reveal queue if they were in it
+            const queueIndex = this.unfoundPlayerQueue.indexOf(socketId);
+            if (queueIndex > -1) this.unfoundPlayerQueue.splice(queueIndex, 1);
+
+            if (wasActiveUnfound) {
+                console.log(`[${this.roomCode}] Active reveal player disconnected. Activating next...`);
+                this.activateNextUnfoundPlayer();
+            } else {
+                this.broadcastUpdateState();
             }
         } else {
-            // If the game state is no longer 'Seeking', clear this interval
-             if (room.seekTimerInterval) clearInterval(room.seekTimerInterval);
-             room.seekTimerInterval = null;
+            // For other states (e.g., GameOver Seekers Win), just update
+            this.broadcastUpdateState();
         }
-    }, 1000);
+        return false; // Indicate room should not be deleted
+    }
+
+    isEmpty() {
+        return Object.keys(this.players).length === 0;
+    }
+
+    getPlayer(socketId) {
+        return this.players[socketId];
+    }
+
+    getPlayerCount() {
+        return Object.keys(this.players).length;
+    }
+
+    _promoteNewHider() {
+        const remainingPlayers = Object.values(this.players).sort((a, b) => a.number - b.number);
+        if (remainingPlayers.length > 0) {
+            remainingPlayers[0].role = PLAYER_ROLE.HIDER;
+            console.log(`[${this.roomCode}] P${remainingPlayers[0].number} (${remainingPlayers[0].id}) promoted to Hider.`);
+            // Note: Player numbers are not reassigned for simplicity
+        }
+    }
+
+    // --- Sound Assignment ---
+
+    _assignUniqueSounds(player) {
+        let animalSoundURL = BASE_ANIMAL_SOUNDS[0] || null;
+        let unfoundSoundURL = BASE_UNFOUND_SOUNDS[0] || null;
+
+        if (NUM_UNIQUE_SOUND_PAIRS > 0) {
+            const availableAnimal = BASE_ANIMAL_SOUNDS.filter(s => !this.assignedAnimalSounds.has(s));
+            if (availableAnimal.length > 0) {
+                animalSoundURL = availableAnimal[Math.floor(Math.random() * availableAnimal.length)];
+            } else {
+                animalSoundURL = BASE_ANIMAL_SOUNDS[(player.number - 1) % NUM_UNIQUE_SOUND_PAIRS];
+                console.warn(`[${this.roomCode}] Ran out of unique animal sounds, assigning fallback: ${animalSoundURL}`);
+            }
+            this.assignedAnimalSounds.add(animalSoundURL);
+
+            const availableUnfound = BASE_UNFOUND_SOUNDS.filter(s => !this.assignedUnfoundSounds.has(s));
+            if (availableUnfound.length > 0) {
+                unfoundSoundURL = availableUnfound[Math.floor(Math.random() * availableUnfound.length)];
+            } else {
+                unfoundSoundURL = BASE_UNFOUND_SOUNDS[(player.number - 1) % NUM_UNIQUE_SOUND_PAIRS];
+                console.warn(`[${this.roomCode}] Ran out of unique unfound sounds, assigning fallback: ${unfoundSoundURL}`);
+            }
+            this.assignedUnfoundSounds.add(unfoundSoundURL);
+        } else {
+             console.error(`[${this.roomCode}] No sound pairs defined or available! Assigning null.`);
+             animalSoundURL = null;
+             unfoundSoundURL = null;
+        }
+        player.uniqueAnimalSoundURL = animalSoundURL;
+        player.uniqueUnfoundSoundURL = unfoundSoundURL;
+    }
+
+    // --- Game State & Logic ---
+
+    updateSettings(settings) {
+        let updated = false;
+        // Validate and update Time Limit
+        const newTimeLimit = parseInt(settings?.seekTimeLimit, 10);
+        if (!isNaN(newTimeLimit) && newTimeLimit >= MIN_SEEK_TIME_LIMIT_S && newTimeLimit <= MAX_SEEK_TIME_LIMIT_S) {
+            if (this.seekTimeLimit !== newTimeLimit) {
+                this.seekTimeLimit = newTimeLimit;
+                console.log(`[${this.roomCode}] Time limit updated to ${newTimeLimit}s.`);
+                updated = true;
+            }
+        } else if (settings?.seekTimeLimit !== undefined) {
+            throw new Error(`Invalid time limit. Must be between ${MIN_SEEK_TIME_LIMIT_S} and ${MAX_SEEK_TIME_LIMIT_S} seconds.`);
+        }
+
+        // Validate and update Sound Plays per Player
+        const newSoundPlays = parseInt(settings?.soundPlaysPerPlayer, 10);
+        if (!isNaN(newSoundPlays) && newSoundPlays >= MIN_SOUND_PLAYS && newSoundPlays <= MAX_SOUND_PLAYS) {
+            if (this.soundPlaysPerPlayer !== newSoundPlays) {
+                this.soundPlaysPerPlayer = newSoundPlays;
+                console.log(`[${this.roomCode}] Sound plays per player updated to ${newSoundPlays}.`);
+                updated = true;
+            }
+        } else if (settings?.soundPlaysPerPlayer !== undefined) {
+            throw new Error(`Invalid sounds per phone. Must be between ${MIN_SOUND_PLAYS} and ${MAX_SOUND_PLAYS}.`);
+        }
+
+        if (updated) {
+            this.broadcastUpdateState();
+        }
+    }
+
+    startHidingPhase() {
+        if (this.gameState !== GAME_STATE.WAITING) throw new Error("Game is not in Waiting state.");
+        if (this.getPlayerCount() < MIN_PLAYERS_TO_START) throw new Error(`Need at least ${MIN_PLAYERS_TO_START} players to start.`);
+
+        console.log(`[${this.roomCode}] Initiating Hiding phase.`);
+        this.gameState = GAME_STATE.HIDING;
+        Object.values(this.players).forEach(p => p.resetForNewGame()); // Reset ready/found/soundsPlayed
+        this.clearGameIntervals(); // Ensure no old timers
+        this.winner = null;
+        this.seekStartTime = null;
+        this.broadcastUpdateState();
+    }
+
+    confirmPlayerHidden(socketId) {
+        const player = this.getPlayer(socketId);
+        if (!player) throw new Error("Player not found in room.");
+        if (this.gameState !== GAME_STATE.HIDING) throw new Error("Not in Hiding phase.");
+        if (player.isReady) return; // Already confirmed
+
+        player.isReady = true;
+        console.log(`[${this.roomCode}] P${player.number} (${socketId}) confirmed hidden.`);
+
+        if (this._checkAllRemainingReady()) {
+            console.log(`[${this.roomCode}] All players confirmed hidden. Starting pre-seek countdown.`);
+            this.broadcastUpdateState(); // Broadcast final hiding state before countdown
+            this.startPreSeekCountdown();
+        } else {
+            this.broadcastUpdateState(); // Update ready count
+        }
+    }
+
+    _checkAllRemainingReady() {
+        if (this.isEmpty()) return false; // Cannot be ready if empty
+        return Object.values(this.players).every(p => p.isReady);
+    }
+
+    startPreSeekCountdown() {
+        if (this.preSeekCountdownInterval) return; // Already running
+
+        console.log(`[${this.roomCode}] Starting pre-seek countdown.`);
+        this.preSeekCountdownValue = PRE_SEEK_COUNTDOWN_S;
+        this.io.to(this.roomCode).emit('preSeekCountdown', this.preSeekCountdownValue); // Emit initial value
+
+        this.preSeekCountdownInterval = setInterval(() => {
+            // Interval checks itself if room still exists via `activeRooms` lookup
+            const currentRoom = activeRooms[this.roomCode];
+            if (!currentRoom || currentRoom !== this) { // Ensure interval belongs to the correct, existing room instance
+                if(this.preSeekCountdownInterval) clearInterval(this.preSeekCountdownInterval);
+                this.preSeekCountdownInterval = null;
+                console.warn(`[${this.roomCode}] Stale preSeekCountdownInterval cleared.`);
+                return;
+            }
+
+            this.preSeekCountdownValue--;
+            this.io.to(this.roomCode).emit('preSeekCountdown', this.preSeekCountdownValue);
+
+            if (this.preSeekCountdownValue <= 0) {
+                clearInterval(this.preSeekCountdownInterval);
+                this.preSeekCountdownInterval = null;
+                this.startSeekingPhase(); // Transition to Seeking phase
+            }
+        }, 1000);
+    }
+
+    startSeekingPhase() {
+        if (this.gameState === GAME_STATE.SEEKING) return; // Prevent multiple starts
+
+        console.log(`[${this.roomCode}] Starting Seeking Phase.`);
+        this.gameState = GAME_STATE.SEEKING;
+        this.seekStartTime = Date.now();
+        this.nextPlayerIndexToPlay = 0; // Reset sound rotation index
+
+        Object.values(this.players).forEach(p => p.resetForSeeking()); // Reset ready/soundsPlayed
+
+        this.startSeekTimer(); // Start the end-game timer
+
+        // Schedule the first sound check
+        console.log(`[${this.roomCode}] Scheduling first sound check.`);
+        if (this.soundRotationTimeout) clearTimeout(this.soundRotationTimeout);
+        this.soundRotationTimeout = setTimeout(() => {
+            this.scheduleNextSound();
+        }, MIN_SOUND_DELAY_MS);
+
+        this.broadcastUpdateState();
+    }
+
+    startSeekTimer() {
+        if (this.seekTimerInterval) return; // Already running
+
+        console.log(`[${this.roomCode}] Seek timer started (${this.seekTimeLimit}s).`);
+        this.seekTimerInterval = setInterval(() => {
+            // Interval checks itself if room still exists via `activeRooms` lookup
+            const currentRoom = activeRooms[this.roomCode];
+             if (!currentRoom || currentRoom !== this) {
+                 if(this.seekTimerInterval) clearInterval(this.seekTimerInterval);
+                 this.seekTimerInterval = null;
+                 console.warn(`[${this.roomCode}] Stale seekTimerInterval cleared.`);
+                 return;
+             }
+
+            if (this.gameState === GAME_STATE.SEEKING) {
+                const elapsedSeconds = (Date.now() - this.seekStartTime) / 1000;
+                if (elapsedSeconds >= this.seekTimeLimit) {
+                    console.log(`[${this.roomCode}] Time limit reached. Hider wins.`);
+                    this.endGame(WINNER_TYPE.HIDER);
+                    // endGame clears the interval
+                }
+            } else {
+                // If game state changed, clear this interval
+                clearInterval(this.seekTimerInterval);
+                this.seekTimerInterval = null;
+            }
+        }, 1000); // Check every second
+    }
+
+    scheduleNextSound() {
+        // Stop scheduling if game not Seeking
+        if (this.gameState !== GAME_STATE.SEEKING) {
+            if (this.soundRotationTimeout) clearTimeout(this.soundRotationTimeout);
+            this.soundRotationTimeout = null;
+            return;
+        }
+
+        const timeElapsedMs = Date.now() - this.seekStartTime;
+        const timeRemainingMs = Math.max(0, (this.seekTimeLimit * 1000) - timeElapsedMs);
+
+        if (timeRemainingMs <= 0) {
+             console.log(`[${this.roomCode}] Time remaining is zero or less in scheduleNextSound. Stopping sound schedule.`);
+             if (this.soundRotationTimeout) clearTimeout(this.soundRotationTimeout);
+             this.soundRotationTimeout = null;
+            return; // Time is up, timer will handle game end
+        }
+
+        const sortedPlayers = Object.values(this.players).sort((a, b) => a.number - b.number);
+        const eligiblePlayers = sortedPlayers.filter(p => !p.isFound && p.soundsPlayed < this.soundPlaysPerPlayer);
+
+        let dynamicDelayMs = CHECK_INTERVAL_WHEN_NO_SOUNDS_MS;
+        let playerToPlay = null;
+
+        if (eligiblePlayers.length > 0) {
+            const totalPlaysLeft = eligiblePlayers.reduce((sum, p) => sum + (this.soundPlaysPerPlayer - p.soundsPlayed), 0);
+
+            if (totalPlaysLeft > 0) {
+                dynamicDelayMs = Math.max(MIN_SOUND_DELAY_MS, timeRemainingMs / totalPlaysLeft);
+
+                // Select player using rotation index
+                const nextEligiblePlayerIndex = this.nextPlayerIndexToPlay % eligiblePlayers.length;
+                playerToPlay = eligiblePlayers[nextEligiblePlayerIndex];
+                this.nextPlayerIndexToPlay = (nextEligiblePlayerIndex + 1); // Increment for next time
+
+                // Emit sound to the selected player
+                if (playerToPlay && playerToPlay.uniqueAnimalSoundURL) {
+                    this.io.to(playerToPlay.id).emit('playSound', { soundURL: playerToPlay.uniqueAnimalSoundURL });
+                    playerToPlay.soundsPlayed++;
+                     console.log(`[${this.roomCode}] Sound play ${playerToPlay.soundsPlayed}/${this.soundPlaysPerPlayer} triggered for P${playerToPlay.number}. Next check in ${dynamicDelayMs.toFixed(0)}ms.`);
+                } else {
+                     console.warn(`[${this.roomCode}] Eligible player P${playerToPlay?.number} found but has no sound URL. Skipping play.`);
+                     playerToPlay = null; // Ensure no sound is counted if URL missing
+                }
+            } else {
+                 console.warn(`[${this.roomCode}] Eligible players found, but totalPlaysLeft is 0. Using default check interval.`);
+            }
+        } else {
+            // console.log(`[${this.roomCode}] No eligible players found for sound rotation this cycle. Next check in ${dynamicDelayMs}ms.`); // Verbose
+        }
+
+        // Schedule the next check
+        if (this.soundRotationTimeout) clearTimeout(this.soundRotationTimeout);
+        this.soundRotationTimeout = setTimeout(() => {
+            // Check room still exists before recursive call
+            if (activeRooms[this.roomCode] === this) {
+                this.scheduleNextSound();
+            } else {
+                 console.warn(`[${this.roomCode}] Room instance changed or deleted before next sound schedule.`);
+            }
+        }, dynamicDelayMs);
+    }
+
+
+    markPlayerFound(socketId) {
+        const player = this.getPlayer(socketId);
+        if (!player) throw new Error("Player not found.");
+        if (player.isFound) return; // Already found
+
+        // Allow marking found during Seeking OR during Game Over reveal
+         if (this.gameState !== GAME_STATE.SEEKING && !(this.gameState === GAME_STATE.GAME_OVER && this.winner === WINNER_TYPE.HIDER)) {
+             throw new Error(`Cannot mark found in current game state: ${this.gameState}`);
+         }
+
+        console.log(`[${this.roomCode}] P${player.number} (${socketId}) marked self as found.`);
+        player.isFound = true;
+
+        if (this.gameState === GAME_STATE.SEEKING) {
+            if (!this.checkSeekerWin()) { // checkSeekerWin calls endGame if true
+                this.broadcastUpdateState(); // Game continues, update state
+            }
+        } else if (this.gameState === GAME_STATE.GAME_OVER) { // Must be Hider Win Reveal
+             console.log(`[${this.roomCode}] P${player.number} found during Hider reveal.`);
+            if (socketId === this.activeUnfoundPlayerId) {
+                console.log(`[${this.roomCode}] Active reveal player ${player.number} found. Activating next...`);
+                this.activateNextUnfoundPlayer(); // Move to next in queue
+            } else {
+                 // Remove from queue if found out of order
+                 const queueIndex = this.unfoundPlayerQueue.indexOf(socketId);
+                 if (queueIndex > -1) this.unfoundPlayerQueue.splice(queueIndex, 1);
+                this.broadcastUpdateState(); // Update list render
+            }
+        }
+    }
+
+    checkSeekerWin() {
+        if (this.gameState !== GAME_STATE.SEEKING) return false;
+
+        const allFound = Object.values(this.players).every(p => p.isFound);
+        if (allFound) {
+            console.log(`[${this.roomCode}] Seeker win condition met.`);
+            this.endGame(WINNER_TYPE.SEEKERS);
+            return true;
+        }
+        return false;
+    }
+
+    endGame(winner) {
+        if (this.gameState === GAME_STATE.GAME_OVER) return; // Already ended
+
+        console.log(`[${this.roomCode}] Game Over. Winner: ${winner}`);
+        this.clearGameIntervals(); // Stop all active timers/loops
+
+        this.gameState = GAME_STATE.GAME_OVER;
+        this.winner = winner;
+
+        if (winner === WINNER_TYPE.HIDER) {
+            this.startGameOverReveal();
+        } else if (winner === WINNER_TYPE.SEEKERS) {
+            this.io.to(this.roomCode).emit('playVictoryMelody');
+            this.broadcastUpdateState(); // Send final state immediately
+        } else {
+            this.broadcastUpdateState(); // Should not happen
+        }
+    }
+
+    startGameOverReveal() {
+        if (this.winner !== WINNER_TYPE.HIDER) return;
+
+        this.unfoundPlayerQueue = Object.values(this.players)
+            .filter(p => !p.isFound)
+            .sort((a, b) => a.number - b.number)
+            .map(p => p.id);
+
+        console.log(`[${this.roomCode}] Starting Hider Win reveal. Queue:`, this.unfoundPlayerQueue);
+        this.activateNextUnfoundPlayer();
+    }
+
+    activateNextUnfoundPlayer() {
+        if (this.gameState !== GAME_STATE.GAME_OVER) return; // Only run during game over
+
+        this.activeUnfoundPlayerId = null; // Reset active player
+
+        if (this.unfoundPlayerQueue.length === 0) {
+            console.log(`[${this.roomCode}] Reveal queue empty. Reveal finished.`);
+            this.broadcastUpdateState(); // Update state one last time
+            return;
+        }
+
+        const nextPlayerId = this.unfoundPlayerQueue.shift(); // Get next ID
+        this.activeUnfoundPlayerId = nextPlayerId;
+
+        const player = this.players[nextPlayerId];
+        if (player && player.uniqueUnfoundSoundURL) {
+            this.io.to(nextPlayerId).emit('becomeActiveUnfound', { soundURL: player.uniqueUnfoundSoundURL });
+            console.log(`[${this.roomCode}] Activating P${player.number} (${nextPlayerId}) for reveal. Sound: ${player.uniqueUnfoundSoundURL}.`);
+        } else {
+            console.warn(`[${this.roomCode}] Player ${nextPlayerId} or their unfound sound not found during reveal activation. Skipping.`);
+            this.activateNextUnfoundPlayer(); // Immediately try the next player
+            return; // Avoid broadcasting state for the skipped player
+        }
+
+        this.broadcastUpdateState(); // Update all clients with the new active player
+    }
+
+
+    requestPlayAgain(socketId) {
+         if (this.gameState !== GAME_STATE.GAME_OVER) throw new Error("Game is not over yet.");
+         const player = this.getPlayer(socketId);
+         if (!player) throw new Error("Player not found.");
+
+         console.log(`[${this.roomCode}] P${player.number} (${socketId}) requested Play Again.`);
+         this.resetForNewGame();
+    }
+
+    resetForNewGame() {
+        console.log(`[${this.roomCode}] Resetting room for new game.`);
+        this.gameState = GAME_STATE.WAITING;
+        this.winner = null;
+        this.clearGameIntervals();
+        this.seekStartTime = null;
+        this.activeUnfoundPlayerId = null;
+        this.unfoundPlayerQueue = [];
+        this.assignedAnimalSounds.clear();
+        this.assignedUnfoundSounds.clear();
+
+        // Reset player states and re-assign sounds
+        Object.values(this.players).forEach(p => {
+            p.resetForNewGame();
+            this._assignUniqueSounds(p); // Reassign sounds
+        });
+
+        // Hider role remains the same
+
+        this.broadcastUpdateState();
+    }
+
+
+    // --- Utility & State Management ---
+
+    clearGameIntervals() {
+        if (this.preSeekCountdownInterval) clearInterval(this.preSeekCountdownInterval);
+        if (this.seekTimerInterval) clearInterval(this.seekTimerInterval);
+        if (this.soundRotationTimeout) clearTimeout(this.soundRotationTimeout);
+
+        this.preSeekCountdownInterval = null;
+        this.seekTimerInterval = null;
+        this.soundRotationTimeout = null;
+        this.nextPlayerIndexToPlay = 0; // Reset sound index as well
+
+        console.log(`[${this.roomCode}] Cleared game intervals and sound schedule state.`);
+    }
+
+    getClientState() {
+        const playersForClient = {};
+        Object.values(this.players).forEach(p => {
+            playersForClient[p.id] = p.getClientState();
+        });
+
+        return {
+            roomCode: this.roomCode,
+            players: playersForClient,
+            gameState: this.gameState,
+            seekTimeLimit: this.seekTimeLimit,
+            soundPlaysPerPlayer: this.soundPlaysPerPlayer, // Include this setting
+            seekStartTime: this.seekStartTime,
+            winner: this.winner,
+            activeUnfoundPlayerId: this.activeUnfoundPlayerId,
+        };
+    }
+
+    broadcastUpdateState() {
+        const state = this.getClientState();
+        if (state) {
+            this.io.to(this.roomCode).emit('updateState', state);
+        } else {
+            console.warn(`[${this.roomCode}] Attempted to broadcast state but failed to get client state.`);
+        }
+    }
 }
 
 
-/**
- * Schedules the next sound to be played during the Seeking phase.
- * Finds the next player in the rotation who hasn't been found yet,
- * tells their client to play their unique "animal" sound, and schedules the next call to this function.
- * @param {string} roomCode - The room where sounds are being played.
- */
-function scheduleNextSound(roomCode) {
-    const room = rooms[roomCode];
-    // Stop scheduling if the room doesn't exist or the game is not in 'Seeking' state
-    if (!room || room.gameState !== 'Seeking') {
-        if(room && room.soundRotationTimeout) clearTimeout(room.soundRotationTimeout); // Clear any pending timeout
-        if(room) room.soundRotationTimeout = null;
-        console.log(`[${roomCode}] Stopping sound rotation (invalid state: ${room?.gameState}).`);
-        return;
-    }
+// =============================================================================
+// == Server Setup & Socket Handlers
+// =============================================================================
 
-    // Get players sorted by number to ensure consistent rotation order
-    const sortedPlayers = Object.values(room.players).sort((a, b) => a.number - b.number);
-    if (sortedPlayers.length === 0) return; // No players left
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
 
-    let currentPlayerIndex = room.nextPlayerIndexToPlay % sortedPlayers.length; // Start searching from the next index
-    let foundPlayerToPlay = null;
-    let searchAttempts = 0; // To prevent infinite loops if all are found
+// Serve static files
+app.use(express.static(PUBLIC_DIR));
 
-    // Loop through players starting from the next index, wrapping around if needed
-    while (searchAttempts < sortedPlayers.length) {
-        const potentialPlayer = sortedPlayers[currentPlayerIndex];
-        // If this player exists and is not yet found, they are the next to play
-        if (potentialPlayer && !potentialPlayer.isFound) {
-            foundPlayerToPlay = potentialPlayer;
-            break; // Found a player
-        }
-        // Move to the next player index, wrapping around the array
-        currentPlayerIndex = (currentPlayerIndex + 1) % sortedPlayers.length;
-        searchAttempts++;
-    }
-
-    // If an unfound player was found and they have a sound assigned
-    if (foundPlayerToPlay && foundPlayerToPlay.uniqueAnimalSoundURL) {
-        console.log(`[${roomCode}] Sending playSound to Player ${foundPlayerToPlay.number} (${foundPlayerToPlay.id}) Sound: ${foundPlayerToPlay.uniqueAnimalSoundURL}`);
-        // Emit 'playSound' only to the specific player's socket
-        io.to(foundPlayerToPlay.id).emit('playSound', { soundURL: foundPlayerToPlay.uniqueAnimalSoundURL });
-
-        // Update the index for the next rotation
-        room.nextPlayerIndexToPlay = (currentPlayerIndex + 1);
-
-        // Schedule the next call to this function after the calculated delay
-        if (room.soundRotationTimeout) clearTimeout(room.soundRotationTimeout); // Clear previous timeout just in case
-        console.log(`[${roomCode}] Scheduling next sound check in ${room.soundDelay}ms.`);
-        room.soundRotationTimeout = setTimeout(() => {
-            scheduleNextSound(roomCode);
-        }, room.soundDelay);
-
-    } else {
-        // If no unfound players were found in the loop
-        console.log(`[${roomCode}] No suitable unfound players found during sound rotation. Stopping rotation.`);
-        if (room.soundRotationTimeout) clearTimeout(room.soundRotationTimeout); // Stop the rotation
-        room.soundRotationTimeout = null;
-        // If we searched all players and found none, it means they are all found
-        if (searchAttempts >= sortedPlayers.length) {
-             checkSeekerWin(roomCode); // Double-check the win condition
-        }
-    }
-}
-
-
-// --- Socket.IO Connection Handler ---
-// This function runs whenever a new client connects to the server
+// Main Socket.IO connection handler
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
 
-    // --- Room Management Events ---
+    // --- Room Management Handlers ---
 
-    // Handle 'createRoom' event from a client
     socket.on('createRoom', () => {
-        const roomCode = generateRoomCode(); // Generate a unique code
-        const playerNumber = 1; // The creator is always Player 1
-        const assignedAnimalSounds = new Set(); // Track sounds used in this room
-        const assignedUnfoundSounds = new Set();
-
-        // Assign unique sounds randomly for the first player (Hider)
-        let animalSoundURL = baseAnimalSounds[0]; // Default fallback
-        let unfoundSoundURL = baseUnfoundSounds[0]; // Default fallback
-        const availableAnimal = baseAnimalSounds.filter(s => !assignedAnimalSounds.has(s));
-        if (availableAnimal.length > 0) animalSoundURL = availableAnimal[Math.floor(Math.random() * availableAnimal.length)];
-        assignedAnimalSounds.add(animalSoundURL);
-        const availableUnfound = baseUnfoundSounds.filter(s => !assignedUnfoundSounds.has(s));
-        if (availableUnfound.length > 0) unfoundSoundURL = availableUnfound[Math.floor(Math.random() * availableUnfound.length)];
-        assignedUnfoundSounds.add(unfoundSoundURL);
-
-        // Create the room object in the 'rooms' store
-        rooms[roomCode] = {
-            roomCode: roomCode,
-            players: {
-                [socket.id]: { // Use socket ID as the key for the player
-                    id: socket.id, number: playerNumber, role: 'Hider', // First player is Hider
-                    isReady: false, isFound: false, // Initial states
-                    uniqueAnimalSoundURL: animalSoundURL, uniqueUnfoundSoundURL: unfoundSoundURL // Assigned sounds
-                }
-            },
-            gameState: 'Waiting', // Initial game state
-            seekTimeLimit: 120, // Default time limit
-            seekTimerInterval: null, seekStartTime: null, // Timer related state
-            winner: null, preSeekCountdownInterval: null, preSeekCountdownValue: 10, // Countdown state
-            soundRotationTimeout: null, nextPlayerIndexToPlay: 0, soundDelay: 5000, // Sound rotation state
-            assignedAnimalSounds: assignedAnimalSounds, assignedUnfoundSounds: assignedUnfoundSounds, // Sets to track used sounds
-            unfoundPlayerQueue: [], activeUnfoundPlayerId: null, // Game over reveal state
-        };
-        socket.join(roomCode); // Have the socket join the Socket.IO room
-        console.log(`[${roomCode}] Room created by ${socket.id}. Player 1 (Hider) assigned Animal Sound: ${animalSoundURL}, Unfound Sound: ${unfoundSoundURL}.`);
-        broadcastUpdateState(roomCode); // Send the initial state to the creator
+        try {
+            const roomCode = generateUniqueRoomCode();
+            const newRoom = new Room(roomCode, io); // Pass io instance
+            activeRooms[roomCode] = newRoom;
+            newRoom.addPlayer(socket); // addPlayer handles joining and broadcasting
+        } catch (error) {
+            console.error(`[${socket.id}] Error creating room:`, error);
+            socket.emit('errorMsg', error.message || 'Failed to create room. Please try again.');
+        }
     });
 
-    // Handle 'joinRoom' event from a client
     socket.on('joinRoom', (roomCode) => {
-        const room = rooms[roomCode];
-        // Validate room existence and game state
-        if (!room) { socket.emit('errorMsg', 'Room not found.'); return; }
-        if (room.gameState !== 'Waiting') { socket.emit('errorMsg', 'Game has already started.'); return; }
-
-        const playerNumber = Object.keys(room.players).length + 1; // Assign the next available player number
-
-        // Assign unique sounds randomly with fallback if all base sounds are used
-        let animalSoundURL = baseAnimalSounds[0];
-        let unfoundSoundURL = baseUnfoundSounds[0];
-        const availableAnimal = baseAnimalSounds.filter(s => !room.assignedAnimalSounds.has(s));
-        if (availableAnimal.length > 0) animalSoundURL = availableAnimal[Math.floor(Math.random() * availableAnimal.length)];
-        else animalSoundURL = baseAnimalSounds[(playerNumber - 1) % numUniqueSounds]; // Fallback: cycle through sounds
-        room.assignedAnimalSounds.add(animalSoundURL); // Add to the room's used set
-        const availableUnfound = baseUnfoundSounds.filter(s => !room.assignedUnfoundSounds.has(s));
-        if (availableUnfound.length > 0) unfoundSoundURL = availableUnfound[Math.floor(Math.random() * availableUnfound.length)];
-        else unfoundSoundURL = baseUnfoundSounds[(playerNumber - 1) % numUniqueSounds]; // Fallback: cycle through sounds
-        room.assignedUnfoundSounds.add(unfoundSoundURL); // Add to the room's used set
-
-        // Add the new player to the room's player list
-        room.players[socket.id] = {
-            id: socket.id, number: playerNumber, role: 'Seeker', // Joining players are Seekers
-            isReady: false, isFound: false, // Initial states
-            uniqueAnimalSoundURL: animalSoundURL, uniqueUnfoundSoundURL: unfoundSoundURL // Assigned sounds
-        };
-        socket.join(roomCode); // Have the socket join the Socket.IO room
-        console.log(`[${roomCode}] ${socket.id} joined as P${playerNumber}. Assigned Animal: ${animalSoundURL}, Unfound: ${unfoundSoundURL}.`);
-        broadcastUpdateState(roomCode); // Update everyone in the room with the new player list and state
-    });
-
-    // --- Game Configuration and State Changes ---
-
-     // Handle 'configureGame' event (sent by Hider in Waiting room)
-     socket.on('configureGame', (data) => {
-        const roomCode = Array.from(socket.rooms)[1]; // Get room code from socket's rooms (index 0 is usually the socket's own ID room)
-        const room = rooms[roomCode];
-        // Validate: room exists, sender is Hider, game is in Waiting state
-        if (!room || room.players[socket.id]?.role !== 'Hider' || room.gameState !== 'Waiting') return;
-
-        const newTimeLimit = parseInt(data.seekTimeLimit, 10);
-        // Validate the received time limit
-        if (!isNaN(newTimeLimit) && newTimeLimit >= 15 && newTimeLimit <= 600) {
-            room.seekTimeLimit = newTimeLimit;
-            console.log(`[${roomCode}] Time limit updated to ${newTimeLimit}s.`);
-            broadcastUpdateState(roomCode); // Inform clients of the change
-        } else {
-             socket.emit('errorMsg', 'Invalid time limit (must be 15-600s).'); // Send error back to Hider
+        try {
+            const room = activeRooms[roomCode];
+            if (!room) {
+                return socket.emit('errorMsg', 'Room not found.');
+            }
+            room.addPlayer(socket); // addPlayer handles validation, joining, broadcasting
+        } catch (error) {
+            console.error(`[${socket.id}] Error joining room ${roomCode}:`, error);
+            socket.emit('errorMsg', error.message || 'Failed to join room. Please try again.');
         }
     });
 
-    // Handle 'startHiding' event (sent by Hider in Waiting room)
+     socket.on('leaveRoom', () => {
+        const room = findRoomBySocketId(socket.id);
+        if (room) {
+            console.log(`[${room.roomCode}] ${socket.id} requested to leave.`);
+            socket.leave(room.roomCode); // Leave the Socket.IO room
+            // Trigger the disconnect logic manually
+            handleDisconnect(socket);
+        } else {
+            console.warn(`[${socket.id}] Tried to leave but was not in a recognized room.`);
+        }
+    });
+
+    // --- Game Action Handlers ---
+
+    socket.on('updateSettings', (settings) => {
+        const room = findRoomBySocketId(socket.id);
+        try {
+            if (!room) throw new Error("Not currently in a room.");
+            const player = room.getPlayer(socket.id);
+            if (!player) throw new Error("Player not found in room."); // Should not happen if room found
+            if (player.role !== PLAYER_ROLE.HIDER) throw new Error("Only the Hider can change settings.");
+            if (room.gameState !== GAME_STATE.WAITING) throw new Error("Settings can only be changed while waiting.");
+
+            room.updateSettings(settings); // Room method handles validation and broadcasting
+        } catch (error) {
+            console.warn(`[${room?.roomCode || 'No Room'}] Failed 'updateSettings' from ${socket.id}: ${error.message}`);
+            socket.emit('errorMsg', error.message || 'Failed to update settings.');
+        }
+    });
+
     socket.on('startHiding', () => {
-        const roomCode = Array.from(socket.rooms)[1];
-        const room = rooms[roomCode];
-        // Validate: room exists, sender is Hider, game is Waiting
-        if (!room || room.players[socket.id]?.role !== 'Hider' || room.gameState !== 'Waiting') return;
-        // Validate: enough players to start
-        if (Object.keys(room.players).length < 2) { socket.emit('errorMsg', 'Need at least 2 players to start.'); return; }
+        const room = findRoomBySocketId(socket.id);
+        try {
+            if (!room) throw new Error("Not currently in a room.");
+            const player = room.getPlayer(socket.id);
+             if (!player || player.role !== PLAYER_ROLE.HIDER) throw new Error("Only the Hider can start the game.");
 
-        console.log(`[${roomCode}] Hider initiated Hiding phase.`);
-        room.gameState = 'Hiding'; // Change game state
-        // Reset player statuses for the new phase
-        Object.values(room.players).forEach(p => { p.isReady = false; p.isFound = false; });
-        clearGameIntervals(roomCode); // Ensure no old timers are running
-        room.winner = null; room.seekStartTime = null; // Reset winner and start time
-        broadcastUpdateState(roomCode); // Inform clients of the state change
+            room.startHidingPhase(); // Handles validation and broadcasting
+        } catch (error) {
+             console.warn(`[${room?.roomCode || 'No Room'}] Failed 'startHiding' from ${socket.id}: ${error.message}`);
+             socket.emit('errorMsg', error.message || 'Failed to start hiding phase.');
+        }
     });
 
-    // Handle 'confirmHidden' event (sent by any player during Hiding phase)
     socket.on('confirmHidden', () => {
-        const roomCode = Array.from(socket.rooms)[1];
-        const room = rooms[roomCode];
-        const player = room?.players[socket.id];
-        // Validate: room/player exist, game is Hiding, player isn't already ready
-        if (!room || !player || room.gameState !== 'Hiding' || player.isReady) return;
-
-        player.isReady = true; // Mark the player as ready (hidden)
-        console.log(`[${roomCode}] Player ${player.number} confirmed hidden.`);
-
-        // Check if all players in the room are now ready
-        const allReady = Object.values(room.players).every(p => p.isReady);
-        if (allReady) {
-            console.log(`[${roomCode}] All players confirmed hidden. Starting pre-seek countdown.`);
-            // FIX: Broadcast the final state *before* starting the countdown
-            broadcastUpdateState(roomCode);
-            startPreSeekCountdown(roomCode); // Start the countdown
-        } else {
-            // If not all ready, just broadcast the updated count
-            broadcastUpdateState(roomCode);
-        }
+         const room = findRoomBySocketId(socket.id);
+         try {
+             if (!room) throw new Error("Not currently in a room.");
+             room.confirmPlayerHidden(socket.id); // Handles validation and broadcasting/state change
+         } catch (error) {
+             console.warn(`[${room?.roomCode || 'No Room'}] Failed 'confirmHidden' from ${socket.id}: ${error.message}`);
+             // No error message needed for client here typically
+         }
     });
 
-    // Handle 'markSelfFound' event (sent by any player during Seeking or Game Over reveal)
     socket.on('markSelfFound', () => {
-        const roomCode = Array.from(socket.rooms)[1];
-        const room = rooms[roomCode];
-        const player = room?.players[socket.id];
-        // Validate: room/player exist, player isn't already found
-        if (!room || !player || player.isFound) return;
+         const room = findRoomBySocketId(socket.id);
+          try {
+             if (!room) throw new Error("Not currently in a room.");
+             room.markPlayerFound(socket.id); // Handles validation, state changes, broadcasting
+         } catch (error) {
+             console.warn(`[${room?.roomCode || 'No Room'}] Failed 'markSelfFound' from ${socket.id}: ${error.message}`);
+             // No error message needed for client here typically
+         }
+    });
 
-        console.log(`[${roomCode}] Player ${player.number} marked self as found.`);
-        player.isFound = true; // Mark the player as found
+    socket.on('requestPlayAgain', () => {
+        const room = findRoomBySocketId(socket.id);
+         try {
+             if (!room) throw new Error("Not currently in a room.");
+             room.requestPlayAgain(socket.id); // Handles validation and broadcasting
+         } catch (error) {
+             console.warn(`[${room?.roomCode || 'No Room'}] Failed 'requestPlayAgain' from ${socket.id}: ${error.message}`);
+             socket.emit('errorMsg', error.message || 'Failed to request play again.');
+         }
+    });
 
-        // Handle the consequences based on the current game state
-        if (room.gameState === 'Seeking') {
-             // Check if this triggers the Seekers win condition
-             const gameEnded = checkSeekerWin(roomCode);
-             // If the game didn't end, broadcast the updated state
-             if (!gameEnded) broadcastUpdateState(roomCode);
-        } else if (room.gameState === 'GameOver' && room.winner === 'Hider') {
-            // If found during the Hider win reveal phase
-            console.log(`[${roomCode}] Player ${player.number} found during Hider reveal.`);
-            // If the player who was found was the one actively playing sound
-            if (socket.id === room.activeUnfoundPlayerId) {
-                 console.log(`[${roomCode}] Active player ${player.number} found. Activating next...`);
-                 activateNextUnfoundPlayer(roomCode); // Move to the next player in the reveal queue
-            } else {
-                 // If a different player was found (e.g., someone found theirs while another was active)
-                 broadcastUpdateState(roomCode); // Just update the state
+    // --- Disconnect Handler ---
+    const handleDisconnect = (disconnectedSocket) => {
+        console.log(`Processing disconnect for: ${disconnectedSocket.id}.`);
+        const room = findRoomBySocketId(disconnectedSocket.id);
+
+        if (room) {
+            const shouldDeleteRoom = room.removePlayer(disconnectedSocket.id); // removePlayer returns true if room becomes empty
+            if (shouldDeleteRoom) {
+                console.log(`[${room.roomCode}] Deleting empty room.`);
+                delete activeRooms[room.roomCode];
             }
         } else {
-            // If found in any other state (e.g., Waiting, Hiding - shouldn't happen), just update
-            broadcastUpdateState(roomCode);
+            console.log(`Disconnected user ${disconnectedSocket.id} was not found in any active room.`);
         }
+    };
+
+    socket.on('disconnect', (reason) => {
+        console.log(`User disconnected event: ${socket.id}. Reason: ${reason}`);
+        handleDisconnect(socket); // Use the encapsulated handler
     });
 
-
-    // Handle 'requestPlayAgain' event (sent by any player during Game Over)
-    socket.on('requestPlayAgain', () => {
-        const roomCode = Array.from(socket.rooms)[1];
-        const room = rooms[roomCode];
-        // Validate: room exists, game is GameOver
-        if (!room || room.gameState !== 'GameOver') return;
-        console.log(`[${roomCode}] Player ${room.players[socket.id]?.number} requested Play Again.`);
-
-        // --- Reset Room State for a New Game ---
-        room.gameState = 'Waiting'; // Back to Waiting state
-        room.winner = null;
-        clearGameIntervals(roomCode); // Stop all timers/loops
-        room.seekStartTime = null;
-        room.activeUnfoundPlayerId = null;
-        room.unfoundPlayerQueue = [];
-        room.nextPlayerIndexToPlay = 0;
-        room.soundDelay = 5000; // Reset sound delay
-        room.assignedAnimalSounds = new Set(); // Clear used sound sets
-        room.assignedUnfoundSounds = new Set();
-
-        // Reset player statuses and re-assign sounds randomly
-        Object.values(room.players).forEach(p => {
-            p.isReady = false; // Reset ready status
-            p.isFound = false; // Reset found status
-
-            // Re-assign sounds similar to how it's done in join/create
-            let animalSoundURL = baseAnimalSounds[0];
-            let unfoundSoundURL = baseUnfoundSounds[0];
-            const availableAnimal = baseAnimalSounds.filter(s => !room.assignedAnimalSounds.has(s));
-            if (availableAnimal.length > 0) animalSoundURL = availableAnimal[Math.floor(Math.random() * availableAnimal.length)];
-            else animalSoundURL = baseAnimalSounds[(p.number - 1) % numUniqueSounds];
-            room.assignedAnimalSounds.add(animalSoundURL);
-            const availableUnfound = baseUnfoundSounds.filter(s => !room.assignedUnfoundSounds.has(s));
-             if (availableUnfound.length > 0) unfoundSoundURL = availableUnfound[Math.floor(Math.random() * availableUnfound.length)];
-             else unfoundSoundURL = baseUnfoundSounds[(p.number - 1) % numUniqueSounds];
-             room.assignedUnfoundSounds.add(unfoundSoundURL);
-             p.uniqueAnimalSoundURL = animalSoundURL; // Update player's assigned sound
-             p.uniqueUnfoundSoundURL = unfoundSoundURL; // Update player's assigned sound
-             console.log(`[${roomCode}] Re-assigned sounds for P${p.number}. Animal: ${animalSoundURL}, Unfound: ${unfoundSoundURL}.`);
-        });
-
-        broadcastUpdateState(roomCode); // Inform all clients about the reset state and new sounds
-    });
-
-
-    // --- Disconnection Handling ---
-    // Handle the 'disconnect' event (automatically triggered by Socket.IO)
-    socket.on('disconnect', () => {
-        console.log(`User disconnected: ${socket.id}`);
-        let roomCode = null;
-        let playerNumber = null;
-        let wasHider = false;
-        let wasActiveUnfound = false; // Was this player the one playing sound in reveal?
-        let wasInSeeking = false;
-        let wasInHiding = false;
-        let disconnectedPlayerSoundAnimal = null;
-        let disconnectedPlayerSoundUnfound = null;
-
-        // Find the room the disconnected player was in
-        for (const rc in rooms) {
-            if (rooms[rc].players[socket.id]) {
-                roomCode = rc;
-                const room = rooms[rc];
-                const player = room.players[socket.id];
-
-                // Store info about the disconnected player before removing them
-                playerNumber = player.number;
-                wasHider = player.role === 'Hider';
-                wasActiveUnfound = socket.id === room.activeUnfoundPlayerId;
-                wasInSeeking = room.gameState === 'Seeking';
-                wasInHiding = room.gameState === 'Hiding';
-                disconnectedPlayerSoundAnimal = player.uniqueAnimalSoundURL;
-                disconnectedPlayerSoundUnfound = player.uniqueUnfoundSoundURL;
-
-                console.log(`[${roomCode}] Player ${playerNumber} (${socket.id}, ${player.role}) disconnected.`);
-                // Remove the player from the room state
-                delete room.players[socket.id];
-
-                // Remove the player's sounds from the assigned sets so they can be reused
-                if (disconnectedPlayerSoundAnimal) room.assignedAnimalSounds?.delete(disconnectedPlayerSoundAnimal);
-                if (disconnectedPlayerSoundUnfound) room.assignedUnfoundSounds?.delete(disconnectedPlayerSoundUnfound);
-
-                // --- Handle Room/Game State Adjustments ---
-
-                // If the room is now empty, delete the room
-                if (Object.keys(room.players).length === 0) {
-                    console.log(`[${roomCode}] Room empty, deleting.`);
-                     clearGameIntervals(roomCode); // Clean up intervals
-                     delete rooms[roomCode]; // Remove room from memory
-                     return; // Stop further processing for this disconnect
-                }
-
-                // If the game was in the Waiting state
-                if (room.gameState === 'Waiting') {
-                    // If the Hider disconnected, promote the next player (lowest number) to Hider
-                    if (wasHider) {
-                        const remaining = Object.values(room.players).sort((a,b) => a.number - b.number);
-                        if (remaining.length > 0) {
-                            remaining[0].role = 'Hider'; // Promote the first remaining player
-                            console.log(`[${roomCode}] P${remaining[0].number} promoted to Hider.`);
-                        }
-                    }
-                    // Renumber players? (Optional, could add complexity)
-                    broadcastUpdateState(roomCode); // Update clients
-                }
-                // If the game was in the Hiding state
-                else if (wasInHiding) {
-                    // Check if all *remaining* players are now ready
-                    const allRemainingReady = Object.values(room.players).every(p => p.isReady);
-                    // If they are, and there are still players left, and countdown isn't running, start it
-                    if (allRemainingReady && Object.keys(room.players).length > 0 && !room.preSeekCountdownInterval) {
-                        startPreSeekCountdown(roomCode);
-                    } else { broadcastUpdateState(roomCode); } // Otherwise, just update state
-                }
-                // If the game was in the Seeking state
-                else if (wasInSeeking) {
-                    // If the Hider disconnected, the Seekers instantly win
-                    if (wasHider) {
-                        console.log(`[${roomCode}] Hider disconnected during Seeking. Seekers win.`);
-                        endGame(roomCode, 'Seekers');
-                    } else {
-                        // If a Seeker disconnected, check if this makes the Seekers win
-                        if (!checkSeekerWin(roomCode)) {
-                            // If game continues, just update state
-                            broadcastUpdateState(roomCode);
-                        }
-                    }
-                }
-                // If the game was in the Game Over state (Hider win reveal)
-                else if (room.gameState === 'GameOver' && room.winner === 'Hider') {
-                     // Remove the disconnected player from the reveal queue if they were in it
-                     const queueIndex = room.unfoundPlayerQueue.indexOf(socket.id);
-                     if (queueIndex > -1) room.unfoundPlayerQueue.splice(queueIndex, 1);
-                     // If the disconnected player was the one actively playing sound
-                     if (wasActiveUnfound) {
-                         activateNextUnfoundPlayer(roomCode); // Activate the next player
-                     } else {
-                         broadcastUpdateState(roomCode); // Otherwise, just update state
-                     }
-                } else {
-                    // For any other state, just broadcast the update
-                    broadcastUpdateState(roomCode);
-                }
-                break; // Exit the loop once the player's room is found and handled
-            }
-        }
-    });
 });
 
+// Helper to find the room a socket is in
+function findRoomBySocketId(socketId) {
+    for (const roomCode in activeRooms) {
+        if (activeRooms[roomCode].players[socketId]) {
+            return activeRooms[roomCode];
+        }
+    }
+    return null;
+}
+
 // --- Server Start ---
-// Start the HTTP server and listen on the defined port
 server.listen(PORT, () => {
-    console.log(`Server listening on *:${PORT}`);
+    console.log(`Hide 'n' Seek Server listening on *:${PORT}`);
+    console.log(`Serving static files from: ${PUBLIC_DIR}`);
+    // Initial sound check warnings happen at the top
 });
