@@ -172,6 +172,7 @@ class Room {
         this.nextPlayerIndexToPlay = 0; // Index for round-robin sound rotation among eligible players
         this.assignedAnimalSounds = new Set(); // Track used sounds in this room
         this.assignedUnfoundSounds = new Set();
+        this.sharedRemainingSoundPlays = 0; // Unused sounds from found phones are recycled to remaining phones
         this.unfoundPlayerQueue = []; // For Hider win reveal sequence
         this.activeUnfoundPlayerId = null; // Tracks who is playing sound in reveal
     }
@@ -279,6 +280,44 @@ class Room {
         return Object.keys(this.players).length;
     }
 
+    getPersonalSoundsRemaining(player) {
+        return Math.max(0, this.soundPlaysPerPlayer - player.soundsPlayed);
+    }
+
+    getTotalRemainingSoundPlays(players) {
+        const personalRemaining = players.reduce((sum, player) => sum + this.getPersonalSoundsRemaining(player), 0);
+        return personalRemaining + this.sharedRemainingSoundPlays;
+    }
+
+    canPlayerReceiveScheduledSound(player) {
+        return !player.isFound && (this.getPersonalSoundsRemaining(player) > 0 || this.sharedRemainingSoundPlays > 0);
+    }
+
+    recycleUnusedSounds(player) {
+        const unusedPersonalSounds = this.getPersonalSoundsRemaining(player);
+        if (unusedPersonalSounds <= 0) return;
+
+        this.sharedRemainingSoundPlays += unusedPersonalSounds;
+        console.log(
+            `[${this.roomCode}] Recycled ${unusedPersonalSounds} unused sound plays from P${player.number}. Shared pool: ${this.sharedRemainingSoundPlays}.`
+        );
+    }
+
+    consumeScheduledSound(player) {
+        if (this.getPersonalSoundsRemaining(player) > 0) {
+            player.soundsPlayed++;
+            return 'personal';
+        }
+
+        if (this.sharedRemainingSoundPlays > 0) {
+            this.sharedRemainingSoundPlays--;
+            player.soundsPlayed++;
+            return 'shared';
+        }
+
+        return null;
+    }
+
     _promoteNewHider() {
         const remainingPlayers = Object.values(this.players).sort((a, b) => a.number - b.number);
         if (remainingPlayers.length > 0) {
@@ -362,6 +401,7 @@ class Room {
         this.gameState = GAME_STATE.HIDING;
         Object.values(this.players).forEach(p => p.resetForNewGame()); // Reset ready/found/soundsPlayed
         this.clearGameIntervals(); // Ensure no old timers
+        this.sharedRemainingSoundPlays = 0;
         this.winner = null;
         this.seekStartTime = null;
         this.broadcastUpdateState();
@@ -425,6 +465,7 @@ class Room {
         this.gameState = GAME_STATE.SEEKING;
         this.seekStartTime = Date.now();
         this.nextPlayerIndexToPlay = 0; // Reset sound rotation index
+        this.sharedRemainingSoundPlays = 0;
 
         Object.values(this.players).forEach(p => p.resetForSeeking()); // Reset ready/soundsPlayed
 
@@ -488,13 +529,13 @@ class Room {
         }
 
         const sortedPlayers = Object.values(this.players).sort((a, b) => a.number - b.number);
-        const eligiblePlayers = sortedPlayers.filter(p => !p.isFound && p.soundsPlayed < this.soundPlaysPerPlayer);
+        const eligiblePlayers = sortedPlayers.filter(p => this.canPlayerReceiveScheduledSound(p));
 
         let dynamicDelayMs = CHECK_INTERVAL_WHEN_NO_SOUNDS_MS;
         let playerToPlay = null;
 
         if (eligiblePlayers.length > 0) {
-            const totalPlaysLeft = eligiblePlayers.reduce((sum, p) => sum + (this.soundPlaysPerPlayer - p.soundsPlayed), 0);
+            const totalPlaysLeft = this.getTotalRemainingSoundPlays(eligiblePlayers);
 
             if (totalPlaysLeft > 0) {
                 dynamicDelayMs = Math.max(MIN_SOUND_DELAY_MS, timeRemainingMs / totalPlaysLeft);
@@ -506,9 +547,15 @@ class Room {
 
                 // Emit sound to the selected player
                 if (playerToPlay && playerToPlay.uniqueAnimalSoundURL) {
-                    this.io.to(playerToPlay.id).emit('playSound', { soundURL: playerToPlay.uniqueAnimalSoundURL });
-                    playerToPlay.soundsPlayed++;
-                     console.log(`[${this.roomCode}] Sound play ${playerToPlay.soundsPlayed}/${this.soundPlaysPerPlayer} triggered for P${playerToPlay.number}. Next check in ${dynamicDelayMs.toFixed(0)}ms.`);
+                    const soundBudgetSource = this.consumeScheduledSound(playerToPlay);
+                    if (!soundBudgetSource) {
+                        console.warn(`[${this.roomCode}] No remaining sound budget available for P${playerToPlay.number}.`);
+                    } else {
+                        this.io.to(playerToPlay.id).emit('playSound', { soundURL: playerToPlay.uniqueAnimalSoundURL });
+                        console.log(
+                            `[${this.roomCode}] Sound play ${playerToPlay.soundsPlayed} triggered for P${playerToPlay.number} using ${soundBudgetSource} budget. Shared pool: ${this.sharedRemainingSoundPlays}. Next check in ${dynamicDelayMs.toFixed(0)}ms.`
+                        );
+                    }
                 } else {
                      console.warn(`[${this.roomCode}] Eligible player P${playerToPlay?.number} found but has no sound URL. Skipping play.`);
                      playerToPlay = null; // Ensure no sound is counted if URL missing
@@ -547,6 +594,9 @@ class Room {
         player.isFound = true;
 
         if (this.gameState === GAME_STATE.SEEKING) {
+            if (Object.values(this.players).some(p => !p.isFound)) {
+                this.recycleUnusedSounds(player);
+            }
             if (!this.checkSeekerWin()) { // checkSeekerWin calls endGame if true
                 this.broadcastUpdateState(); // Game continues, update state
             }
@@ -652,6 +702,7 @@ class Room {
         this.seekStartTime = null;
         this.activeUnfoundPlayerId = null;
         this.unfoundPlayerQueue = [];
+        this.sharedRemainingSoundPlays = 0;
         this.assignedAnimalSounds.clear();
         this.assignedUnfoundSounds.clear();
 

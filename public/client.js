@@ -54,7 +54,8 @@
         FAIL: '/sounds/fail.mp3' // For game over reveal find
     });
 
-    const VIBRATION_DURATION_MS = 200;
+    const VIBRATION_PULSE_MS = 400;
+    const VIBRATION_PAUSE_MS = 200;
     const ROOM_CODE_LENGTH = 5; // Used for input validation
 
     // =========================================================================
@@ -80,6 +81,47 @@
         activeUnfoundLoop: null,
         activeUnfoundPlayer: null,
         knownAnimalSoundURLs: [], // URLs specific to the current game instance
+
+        supportsVibration: function() {
+            return typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function';
+        },
+
+        buildRevealVibrationPattern: function(soundDurationSeconds) {
+            const remainingMs = Math.max(VIBRATION_PULSE_MS, Math.round((soundDurationSeconds || 0) * 1000));
+            const pattern = [];
+            let timeLeftMs = remainingMs;
+
+            while (timeLeftMs > 0) {
+                const pulseMs = Math.min(VIBRATION_PULSE_MS, timeLeftMs);
+                pattern.push(pulseMs);
+                timeLeftMs -= pulseMs;
+
+                if (timeLeftMs <= 0) break;
+
+                const pauseMs = Math.min(VIBRATION_PAUSE_MS, timeLeftMs);
+                pattern.push(pauseMs);
+                timeLeftMs -= pauseMs;
+            }
+
+            return pattern;
+        },
+
+        triggerRevealVibration: function(soundDurationSeconds) {
+            if (!this.supportsVibration()) {
+                console.log("[Unfound Loop] Vibration API unavailable on this device/browser.");
+                return;
+            }
+
+            const pattern = this.buildRevealVibrationPattern(soundDurationSeconds);
+            const didVibrate = navigator.vibrate(pattern);
+            console.log(`[Unfound Loop] Vibration ${didVibrate ? 'started' : 'was rejected'} with pattern:`, pattern);
+        },
+
+        cancelVibration: function() {
+            if (this.supportsVibration()) {
+                navigator.vibrate(0);
+            }
+        },
 
         /** Attempts to start the Tone.js Audio Context. MUST be called after user interaction. */
         attemptStart: function() {
@@ -230,6 +272,7 @@
                  }
                 this.activeUnfoundPlayer = null;
             }
+            this.cancelVibration();
         },
 
         /** Starts looping playback for the unfound sound reveal. */
@@ -257,7 +300,7 @@
                     this.activeUnfoundLoop = new Tone.Loop(time => {
                         if (this.activeUnfoundPlayer && this.activeUnfoundPlayer.loaded) {
                             this.activeUnfoundPlayer.start(time);
-                            if (navigator.vibrate) { navigator.vibrate(VIBRATION_DURATION_MS); }
+                            this.triggerRevealVibration(duration);
                         } else {
                             console.warn("[Unfound Loop] Player became unloaded/invalid. Stopping loop.");
                             this.stopUnfoundSoundLoop();
@@ -926,4 +969,3 @@
     document.addEventListener('DOMContentLoaded', initializeApp);
 
 })(); // End IIFE
-
