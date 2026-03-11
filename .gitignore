@@ -1,0 +1,4 @@
+node_modules/
+.playwright-cli/
+progress.md
+npm-debug.log*
