@@ -97,6 +97,21 @@
         }
     };
 
+    const BrowserEnvironment = {
+        hasTouchInput: function() {
+            return typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0;
+        },
+
+        isAppleMobileBrowser: function() {
+            if (AppConfig.isNativeApp() || !this.hasTouchInput() || typeof navigator === 'undefined') {
+                return false;
+            }
+
+            const userAgent = navigator.userAgent || '';
+            return /iPhone|iPad|iPod/i.test(userAgent) || (userAgent.includes('Macintosh') && navigator.maxTouchPoints > 1);
+        }
+    };
+
     const ScriptLoader = {
         pendingLoads: {},
 
@@ -129,6 +144,136 @@
             });
 
             return this.pendingLoads[src];
+        }
+    };
+
+    const IOSBrowserAudioUnmute = {
+        activationEvents: ['auxclick', 'click', 'contextmenu', 'dblclick', 'keydown', 'keyup', 'mousedown', 'mouseup', 'touchend'],
+        initialized: false,
+        htmlAudioState: 'blocked',
+        webAudioState: 'blocked',
+        silentAudioFile: '',
+        htmlAudioElement: null,
+        audioContext: null,
+        audioSource: null,
+
+        getAudioContextClass: function() {
+            return window.AudioContext || window.webkitAudioContext || null;
+        },
+
+        isSupported: function() {
+            return BrowserEnvironment.isAppleMobileBrowser()
+                && typeof window !== 'undefined'
+                && !!this.getAudioContextClass();
+        },
+
+        init: function() {
+            if (this.initialized || !this.isSupported()) return;
+            this.initialized = true;
+
+            const AudioContextClass = this.getAudioContextClass();
+            const probeContext = new AudioContextClass();
+            this.silentAudioFile = this.createSilentAudioFile(probeContext.sampleRate);
+            void probeContext.close();
+
+            this.activationEvents.forEach(eventName => {
+                window.addEventListener(eventName, this.handleUserActivation, { capture: true, passive: true });
+            });
+        },
+
+        createSilentAudioFile: function(sampleRate) {
+            const arrayBuffer = new ArrayBuffer(10);
+            const dataView = new DataView(arrayBuffer);
+            dataView.setUint32(0, sampleRate, true);
+            dataView.setUint32(4, sampleRate, true);
+            dataView.setUint16(8, 1, true);
+            const missingCharacters = window.btoa(String.fromCharCode(...new Uint8Array(arrayBuffer))).slice(0, 13);
+            return `data:audio/wav;base64,UklGRisAAABXQVZFZm10IBAAAAABAAEA${missingCharacters}AgAZGF0YQcAAACAgICAgICAAAA=`;
+        },
+
+        handleUserActivation: function() {
+            const helper = IOSBrowserAudioUnmute;
+            if (!helper.isSupported()) return;
+
+            if (helper.htmlAudioState === 'blocked') {
+                helper.htmlAudioState = 'pending';
+                helper.createHtmlAudio();
+            }
+
+            if (helper.webAudioState === 'blocked') {
+                helper.webAudioState = 'pending';
+                helper.createWebAudio();
+            }
+        },
+
+        createHtmlAudio: function() {
+            const audio = document.createElement('audio');
+            audio.setAttribute('x-webkit-airplay', 'deny');
+            audio.setAttribute('playsinline', '');
+            audio.setAttribute('webkit-playsinline', '');
+            audio.preload = 'auto';
+            audio.loop = true;
+            audio.src = this.silentAudioFile;
+            audio.load();
+
+            audio.play().then(() => {
+                this.htmlAudioState = 'allowed';
+                this.htmlAudioElement = audio;
+                this.maybeCleanup();
+            }).catch(() => {
+                this.htmlAudioState = 'blocked';
+                audio.pause();
+                audio.removeAttribute('src');
+                audio.load();
+            });
+        },
+
+        createWebAudio: function() {
+            const AudioContextClass = this.getAudioContextClass();
+            if (!AudioContextClass) {
+                this.webAudioState = 'blocked';
+                return;
+            }
+
+            const context = new AudioContextClass();
+            const markAllowed = () => {
+                const source = context.createBufferSource();
+                source.buffer = context.createBuffer(1, 1, 22050);
+                source.connect(context.destination);
+                source.start();
+                this.webAudioState = 'allowed';
+                this.audioContext = context;
+                this.audioSource = source;
+                this.maybeCleanup();
+            };
+
+            const markBlocked = () => {
+                this.webAudioState = 'blocked';
+                void context.close();
+            };
+
+            if (context.state === 'running') {
+                markAllowed();
+                return;
+            }
+
+            context.resume().then(() => {
+                if (context.state === 'running') {
+                    markAllowed();
+                } else {
+                    markBlocked();
+                }
+            }).catch(() => {
+                markBlocked();
+            });
+        },
+
+        maybeCleanup: function() {
+            if (this.htmlAudioState !== 'allowed' || this.webAudioState !== 'allowed') return;
+
+            this.activationEvents.forEach(eventName => {
+                window.removeEventListener(eventName, this.handleUserActivation, { capture: true, passive: true });
+            });
         }
     };
 
@@ -225,6 +370,8 @@
 
         /** Attempts to start the Tone.js Audio Context. MUST be called after user interaction. */
         attemptStart: function() {
+            IOSBrowserAudioUnmute.handleUserActivation();
+
             // Only attempt if Tone is available and context is not already running
             if (!audioContextStarted && typeof Tone !== 'undefined' && Tone.context && Tone.context.state !== 'running') {
                 console.log("Attempting Tone.start() due to user interaction...");
@@ -485,9 +632,99 @@
     const DisplayManager = {
         wakeLockSentinel: null,
         isKeepAwakeEnabled: false,
+        listenersAttached: false,
+        browserWakeLockStatus: 'unknown',
+        browserWakeLockProbeInFlight: null,
 
         getNativePlugin: function() {
             return window.Capacitor?.Plugins?.HideNSeekDisplay || null;
+        },
+
+        canUseBrowserWakeLock: function() {
+            return typeof navigator !== 'undefined' && 'wakeLock' in navigator;
+        },
+
+        shouldShowBrowserAutoLockNotice: function() {
+            return !AppConfig.isNativeApp() && (this.browserWakeLockStatus === 'unsupported' || this.browserWakeLockStatus === 'failed');
+        },
+
+        notifyWakeLockStatusChange: function() {
+            if (activeViewId === VIEW_IDS.WAITING_ROOM && currentRoomState?.gameState === GAME_STATE.WAITING) {
+                UIManager.updateWaitingRoomNoticeVisibility();
+            }
+        },
+
+        attachEventListeners: function() {
+            if (this.listenersAttached || typeof document === 'undefined') return;
+
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'visible' && this.isKeepAwakeEnabled) {
+                    void this.setKeepAwake(true);
+                }
+            });
+
+            window.addEventListener('pageshow', () => {
+                if (this.isKeepAwakeEnabled) {
+                    void this.setKeepAwake(true);
+                }
+            });
+
+            this.listenersAttached = true;
+        },
+
+        handleWakeLockRelease: function() {
+            this.wakeLockSentinel = null;
+
+            if (this.isKeepAwakeEnabled && document.visibilityState === 'visible') {
+                void this.setKeepAwake(true);
+            }
+        },
+
+        requestBrowserWakeLock: async function() {
+            if (!this.canUseBrowserWakeLock() || document.visibilityState !== 'visible') return;
+
+            try {
+                const sentinel = await navigator.wakeLock.request('screen');
+                sentinel.addEventListener('release', () => this.handleWakeLockRelease(), { once: true });
+                this.wakeLockSentinel = sentinel;
+                this.browserWakeLockStatus = 'supported';
+                this.notifyWakeLockStatusChange();
+            } catch (error) {
+                this.wakeLockSentinel = null;
+                this.browserWakeLockStatus = 'failed';
+                this.notifyWakeLockStatusChange();
+                console.warn('Wake lock update failed:', error);
+            }
+        },
+
+        probeBrowserWakeLock: async function() {
+            if (AppConfig.isNativeApp()) return;
+            if (!this.canUseBrowserWakeLock()) {
+                if (this.browserWakeLockStatus !== 'unsupported') {
+                    this.browserWakeLockStatus = 'unsupported';
+                    this.notifyWakeLockStatusChange();
+                }
+                return;
+            }
+
+            if (document.visibilityState !== 'visible') return;
+            if (this.browserWakeLockStatus === 'supported' || this.browserWakeLockProbeInFlight) return;
+
+            this.browserWakeLockProbeInFlight = (async () => {
+                try {
+                    const sentinel = await navigator.wakeLock.request('screen');
+                    this.browserWakeLockStatus = 'supported';
+                    await sentinel.release();
+                } catch (error) {
+                    this.browserWakeLockStatus = 'failed';
+                    console.warn('Wake lock probe failed:', error);
+                } finally {
+                    this.browserWakeLockProbeInFlight = null;
+                    this.notifyWakeLockStatusChange();
+                }
+            })();
+
+            await this.browserWakeLockProbeInFlight;
         },
 
         setDimmed: function(isDimmed) {
@@ -502,10 +739,18 @@
         },
 
         setKeepAwake: async function(enabled) {
-            if (this.isKeepAwakeEnabled === enabled) return;
+            const nativePlugin = this.getNativePlugin();
+            const browserWakeLockSupported = this.canUseBrowserWakeLock();
+
+            if (this.isKeepAwakeEnabled === enabled) {
+                if (!enabled) return;
+                if (nativePlugin?.setKeepAwake) return;
+                if (!browserWakeLockSupported) return;
+                if (this.wakeLockSentinel && !this.wakeLockSentinel.released) return;
+            }
+
             this.isKeepAwakeEnabled = enabled;
 
-            const nativePlugin = this.getNativePlugin();
             if (nativePlugin?.setKeepAwake) {
                 try {
                     await nativePlugin.setKeepAwake({ enabled });
@@ -515,17 +760,22 @@
                 }
             }
 
-            if (!('wakeLock' in navigator)) return;
+            if (!browserWakeLockSupported) return;
 
-            try {
-                if (enabled && !this.wakeLockSentinel) {
-                    this.wakeLockSentinel = await navigator.wakeLock.request('screen');
-                } else if (!enabled && this.wakeLockSentinel) {
+            this.attachEventListeners();
+
+            if (enabled) {
+                if (!this.wakeLockSentinel || this.wakeLockSentinel.released) {
+                    await this.requestBrowserWakeLock();
+                }
+            } else if (this.wakeLockSentinel) {
+                try {
                     await this.wakeLockSentinel.release();
+                } catch (error) {
+                    console.warn('Wake lock release failed:', error);
+                } finally {
                     this.wakeLockSentinel = null;
                 }
-            } catch (error) {
-                console.warn('Wake lock update failed:', error);
             }
         },
 
@@ -584,6 +834,8 @@
             DOMElements.seekTimeLimitInput = document.getElementById('seekTimeLimit');
             DOMElements.soundPlaysInput = document.getElementById('soundPlaysInput');
             DOMElements.browserIphoneAudioNotice = document.getElementById('browserIphoneAudioNotice');
+            DOMElements.browserNotificationNotice = document.getElementById('browserNotificationNotice');
+            DOMElements.browserAutoLockNotice = document.getElementById('browserAutoLockNotice');
             DOMElements.testVolumeBtn = document.getElementById('testVolumeBtn');
             DOMElements.updateSettingsBtn = document.getElementById('updateSettingsBtn');
             DOMElements.startHidingBtn = document.getElementById('startHidingBtn');
@@ -729,6 +981,8 @@
             DOMElements.hiderControls.classList.toggle('hidden', !amIHider);
             DOMElements.browserIphoneAudioNotice.classList.toggle('hidden', AppConfig.isNativeApp());
             DOMElements.testVolumeBtn.disabled = !hasAssignedSound;
+            this.updateWaitingRoomNoticeVisibility();
+            void DisplayManager.probeBrowserWakeLock();
 
             if (amIHider) {
                 // Use client-side MIN_PLAYERS_TO_START if needed, though logic relies on length check
@@ -745,6 +999,13 @@
             DOMElements.playAgainBtn.classList.add('hidden');
             DOMElements.hiderWinRevealSection.classList.add('hidden');
             this.clearError(DOMElements.joinError); // Clear join error when entering waiting room
+        },
+
+        updateWaitingRoomNoticeVisibility: function() {
+            const showBrowserPhoneNotices = !AppConfig.isNativeApp() && BrowserEnvironment.hasTouchInput();
+            DOMElements.browserIphoneAudioNotice.classList.toggle('hidden', !BrowserEnvironment.isAppleMobileBrowser());
+            DOMElements.browserNotificationNotice.classList.toggle('hidden', !showBrowserPhoneNotices);
+            DOMElements.browserAutoLockNotice.classList.toggle('hidden', !showBrowserPhoneNotices || !DisplayManager.shouldShowBrowserAutoLockNotice());
         },
 
         /** Updates the UI for the Hiding Phase view. */
@@ -1216,6 +1477,7 @@
     async function initializeApp() {
         console.log("Hide 'n' Seek: Initializing application...");
         UIManager.init(); // Cache DOM elements first
+        IOSBrowserAudioUnmute.init();
         setupUIEventListeners(); // Setup button clicks etc.
         UIManager.showView(VIEW_IDS.JOIN); // Start at the join view
         await SocketClient.init(); // Start socket connection
