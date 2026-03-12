@@ -4,15 +4,27 @@
   "description": "Real-time multiplayer Hide 'n' Seek web application",
   "main": "server.js",
   "scripts": {
+    "build:web": "node scripts/build-web-bundle.mjs",
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "cap:add:ios": "npx cap add ios",
+    "cap:copy": "npm run build:web && npx cap copy",
+    "cap:open:ios": "npx cap open ios",
+    "cap:sync": "npm run build:web && npx cap sync",
+    "cap:sync:ios": "npm run build:web && npx cap sync ios"
   },
   "dependencies": {
+    "@capacitor/core": "^8.2.0",
+    "@capacitor/ios": "^8.2.0",
     "express": "^4.21.2",
-    "socket.io": "^4.8.1"
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.3",
+    "tone": "^15.1.22"
   },
   "devDependencies": {
-    "nodemon": "^3.0.1"
+    "@capacitor/cli": "^8.2.0",
+    "nodemon": "^3.0.1",
+    "tailwindcss": "^3.4.17"
   },
   "engines": {
     "node": ">=16.0.0"

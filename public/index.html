@@ -4,10 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Hide 'n' Seek</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
     <style>
         /* Basic styles for view containers and pulsing */
         .view { display: none; /* Hide views by default */ }
@@ -29,13 +26,29 @@
         input[type=number] {
           -moz-appearance: textfield; /* Firefox */
         }
-        /* Apply Inter font globally */
+        /* Use a local system font stack so the app bundle stays self-contained. */
         body {
-            font-family: 'Inter', sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        .overlay-focus {
+            position: relative;
+            z-index: 50;
+        }
+        #hiddenDisplayOverlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.96);
+            z-index: 40;
+            display: none;
+            pointer-events: none;
+        }
+        body.hidden-display-mode #hiddenDisplayOverlay {
+            display: block;
         }
     </style>
 </head>
 <body class="bg-gray-900 text-white flex items-center justify-center min-h-screen font-sans">
+    <div id="hiddenDisplayOverlay" aria-hidden="true"></div>
 
     <div id="howToPlayModal" class="fixed inset-0 bg-gray-800 bg-opacity-95 p-6 md:p-10 flex-col items-center justify-center text-left overflow-y-auto view">
           <h2 class="text-3xl font-bold mb-6 text-center">How to Play</h2>
@@ -47,7 +60,7 @@
                   <li>The Hider hides all the phones (including their own).</li>
                   <li>Once all phones are hidden and confirmed via their screens, the Seekers come back in.</li>
                   <li>The <strong class="text-red-500">Seeking Phase</strong> begins! Seekers have a time limit to find the phones.</li>
-                  <li>Each hidden phone will periodically play its own unique sound (up to a set number of times) to help the Seekers find it.</li>
+                  <li>Each hidden phone will periodically play its own unique sound to help the Seekers find it.</li>
                   <li>When a phone is found, press the <strong class="text-green-500">"Mark Phone as Found"</strong> button on its screen.</li>
                   <li><strong class="text-green-400">Seekers Win</strong> if all phones are found before time runs out!</li>
                   <li><strong class="text-red-400">Hider Wins</strong> if time runs out first! (Unfound phones will then play sounds one-by-one until marked found).</li>
@@ -80,10 +93,17 @@
                 </ul>
         </div>
 
-        <p class="text-base text-yellow-300 mt-4 text-center px-2">
-            <strong class="font-bold">Important:</strong> Please set all phones to the <strong class="font-bold">same volume level</strong>.
-            <br>For iPhones, ensure the side switch is <strong class="font-bold">NOT</strong> set to silent mode.
-        </p>
+        <div class="mt-4 text-center px-2 space-y-2">
+            <p class="text-base text-yellow-300">
+                <strong class="font-bold">Important:</strong> Please set all phones to the <strong class="font-bold">same volume level</strong>.
+            </p>
+            <p id="browserIphoneAudioNotice" class="text-sm text-yellow-200">
+                For browser play on iPhone, ensure the side switch is <strong class="font-bold">NOT</strong> set to silent mode.
+            </p>
+            <button id="testVolumeBtn" class="bg-gray-700 hover:bg-gray-600 text-white font-semibold py-2 px-4 rounded shadow-md transition duration-150 ease-in-out text-sm disabled:opacity-50 disabled:cursor-not-allowed">
+                Test My Sound
+            </button>
+        </div>
 
         <div id="hider-controls" class="hidden w-full bg-gray-800 p-4 rounded-lg shadow-md space-y-3 mt-4">
              <h2 class="text-xl font-semibold mb-2 text-center text-indigo-300">Hider Controls</h2>
@@ -92,7 +112,7 @@
                 <input type="number" id="seekTimeLimit" value="120" min="15" max="600" class="p-1 w-20 bg-gray-700 border border-gray-600 rounded text-white text-center focus:outline-none focus:ring-1 focus:ring-indigo-500">
             </div>
             <div class="flex items-center justify-center space-x-2">
-                <label for="soundPlaysInput" class="text-gray-300 w-28 text-right">Sounds per Round:</label>
+                <label for="soundPlaysInput" class="text-gray-300 w-40 text-right">Sounds per Phone:</label>
                 <input type="number" id="soundPlaysInput" value="6" min="1" max="20" class="p-1 w-20 bg-gray-700 border border-gray-600 rounded text-white text-center focus:outline-none focus:ring-1 focus:ring-indigo-500">
             </div>
              <button id="updateSettingsBtn" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded shadow-md transition duration-150 ease-in-out text-sm">Update Settings</button>
@@ -105,9 +125,9 @@
         <h1 class="text-4xl font-bold text-yellow-400 pulse">Hiding Phase!</h1>
         <p id="hiding-instructions" class="text-xl">Send the Seekers outside of the room and hide this phone now! Press the button below when it's hidden.</p>
         <p id="hiding-status" class="text-lg text-gray-400">(0/X phones confirmed hidden)</p>
-        <button id="confirmHiddenBtn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded shadow-md transition duration-150 ease-in-out text-lg">Confirm Phone as Hidden</button>
-        <p id="hiding-confirmed-text" class="hidden text-xl text-green-400">This phone is hidden!</p>
-         <div class="mt-4">
+        <button id="confirmHiddenBtn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded shadow-md transition duration-150 ease-in-out text-lg overlay-focus">Confirm Phone as Hidden</button>
+        <p id="hiding-confirmed-text" class="hidden text-xl text-green-400 overlay-focus">This phone is hidden!</p>
+         <div class="mt-4 overlay-focus">
              <p class="text-gray-400">Seeking starts in:</p>
              <p id="hiding-countdown" class="text-6xl font-mono text-red-500">-</p>
          </div>
@@ -123,11 +143,11 @@
                 </ul>
         </div>
 
-         <div id="hidden-device-ui" class="text-center space-y-3">
+         <div id="hidden-device-ui" class="text-center space-y-3 overlay-focus">
              <button id="markSelfFoundBtn" class="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded shadow-md transition duration-150 ease-in-out text-lg">Mark Phone as Found</button>
          </div>
 
-         <p id="alreadyFoundText" class="hidden text-xl text-green-400 font-semibold">✅ Phone Found!</p>
+         <p id="alreadyFoundText" class="hidden text-xl text-green-400 font-semibold overlay-focus">✅ Phone Found!</p>
 
     </div>
 
@@ -142,7 +162,7 @@
                 </ul>
         </div>
 
-        <div id="hider-win-reveal-section" class="hidden w-full text-center space-y-3 mt-4 p-4 bg-gray-700 rounded-lg">
+        <div id="hider-win-reveal-section" class="hidden w-full text-center space-y-3 mt-4 p-4 bg-gray-700 rounded-lg overlay-focus">
              <p id="hider-win-status" class="text-xl text-yellow-300"></p>
              <button id="markFoundGameOverBtn" class="hidden bg-yellow-600 hover:bg-yellow-700 text-black font-bold py-3 px-6 rounded shadow-md transition duration-150 ease-in-out text-lg">Mark Phone as Found</button>
              <p id="gameOverFoundText" class="hidden text-xl text-green-400 font-semibold">✅ Phone found during reveal!</p>
@@ -151,9 +171,9 @@
         <button id="playAgainBtn" class="mt-6 bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-6 rounded shadow-md transition duration-150 ease-in-out text-lg">Play Again</button>
     </div>
 
-
-    <script src="/socket.io/socket.io.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.7.77/Tone.js"></script>
+    <script src="app-config.js"></script>
+    <script src="vendor/socket.io.min.js"></script>
+    <script src="vendor/tone.js"></script>
     <script src="client.js"></script>
 </body>
 </html>

@@ -2,3 +2,9 @@ node_modules/
 .playwright-cli/
 progress.md
 npm-debug.log*
+ios/App/Pods/
+ios/App/build/
+ios/App/.symlinks/
+ios/App/DerivedData/
+**/xcuserdata/
+*.xcuserstate

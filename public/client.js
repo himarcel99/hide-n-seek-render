@@ -73,6 +73,65 @@
     // =========================================================================
     const DOMElements = {}; // Populated by UIManager.init
 
+    const AppConfig = {
+        getConfiguredServerUrl: function() {
+            const configuredUrl = window.HNS_CONFIG?.serverUrl;
+            return typeof configuredUrl === 'string' ? configuredUrl.trim().replace(/\/+$/, '') : '';
+        },
+
+        getServerUrl: function() {
+            return this.isNativeApp() ? this.getConfiguredServerUrl() : '';
+        },
+
+        isNativeApp: function() {
+            return !!(window.Capacitor && typeof window.Capacitor.isNativePlatform === 'function' && window.Capacitor.isNativePlatform());
+        },
+
+        requiresConfiguredServerUrl: function() {
+            return this.isNativeApp() && !this.getConfiguredServerUrl();
+        },
+
+        getSocketIoScriptUrl: function() {
+            const serverUrl = this.getServerUrl();
+            return serverUrl ? `${serverUrl}/socket.io/socket.io.js` : '/socket.io/socket.io.js';
+        }
+    };
+
+    const ScriptLoader = {
+        pendingLoads: {},
+
+        load: function(src) {
+            if (this.pendingLoads[src]) return this.pendingLoads[src];
+
+            this.pendingLoads[src] = new Promise((resolve, reject) => {
+                const existingScript = document.querySelector(`script[data-dynamic-src="${src}"]`);
+                if (existingScript?.dataset.loaded === 'true') {
+                    resolve();
+                    return;
+                }
+
+                const script = existingScript || document.createElement('script');
+                script.src = src;
+                script.async = true;
+                script.dataset.dynamicSrc = src;
+
+                script.onload = () => {
+                    script.dataset.loaded = 'true';
+                    resolve();
+                };
+                script.onerror = () => reject(new Error(`Failed to load script: ${src}`));
+
+                if (!existingScript) {
+                    document.head.appendChild(script);
+                }
+            }).finally(() => {
+                delete this.pendingLoads[src];
+            });
+
+            return this.pendingLoads[src];
+        }
+    };
+
     // =========================================================================
     // == Audio Manager (Tone.js)
     // =========================================================================
@@ -82,8 +141,28 @@
         activeUnfoundPlayer: null,
         knownAnimalSoundURLs: [], // URLs specific to the current game instance
 
+        getNativeDisplayPlugin: function() {
+            return window.Capacitor?.Plugins?.HideNSeekDisplay || null;
+        },
+
+        resolveSoundUrl: function(url) {
+            if (!url || typeof url !== 'string') return '';
+
+            if (/^https?:\/\//i.test(url)) {
+                return url;
+            }
+
+            const serverUrl = AppConfig.getServerUrl();
+            if (serverUrl && url.startsWith('/')) {
+                return `${serverUrl}${url}`;
+            }
+
+            return url;
+        },
+
         supportsVibration: function() {
-            return typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function';
+            const nativePlugin = this.getNativeDisplayPlugin();
+            return !!nativePlugin?.startRevealVibration || (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function');
         },
 
         buildRevealVibrationPattern: function(soundDurationSeconds) {
@@ -107,6 +186,20 @@
         },
 
         triggerRevealVibration: function(soundDurationSeconds) {
+            const nativePlugin = this.getNativeDisplayPlugin();
+            const durationMs = Math.max(VIBRATION_PULSE_MS, Math.round((soundDurationSeconds || 0) * 1000));
+
+            if (nativePlugin?.startRevealVibration) {
+                nativePlugin.startRevealVibration({
+                    durationMs,
+                    pulseMs: VIBRATION_PULSE_MS,
+                    pauseMs: VIBRATION_PAUSE_MS
+                }).catch(error => {
+                    console.warn('[Unfound Loop] Native reveal vibration failed:', error);
+                });
+                return;
+            }
+
             if (!this.supportsVibration()) {
                 console.log("[Unfound Loop] Vibration API unavailable on this device/browser.");
                 return;
@@ -118,7 +211,14 @@
         },
 
         cancelVibration: function() {
-            if (this.supportsVibration()) {
+            const nativePlugin = this.getNativeDisplayPlugin();
+            if (nativePlugin?.stopRevealVibration) {
+                nativePlugin.stopRevealVibration().catch(error => {
+                    console.warn('[Unfound Loop] Failed to stop native reveal vibration:', error);
+                });
+            }
+
+            if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
                 navigator.vibrate(0);
             }
         },
@@ -128,7 +228,7 @@
             // Only attempt if Tone is available and context is not already running
             if (!audioContextStarted && typeof Tone !== 'undefined' && Tone.context && Tone.context.state !== 'running') {
                 console.log("Attempting Tone.start() due to user interaction...");
-                Tone.start().then(() => {
+                return Tone.start().then(() => {
                     console.log("Tone.start() successful. Audio context is running.");
                     audioContextStarted = true;
                     this.ensureTransportRunning();
@@ -137,18 +237,30 @@
                     if (currentRoomState && (currentRoomState.gameState === GAME_STATE.WAITING || currentRoomState.gameState === GAME_STATE.HIDING)) {
                          this.preloadGameSounds(currentRoomState.players);
                     }
+                    return true;
                 }).catch(e => {
                     console.error("Tone.start() failed:", e);
                     // Show user-facing error in the join view's error area
                     UIManager.showError("Audio could not be initialized. Sound may not work.", DOMElements.joinError);
+                    return false;
                 });
             } else if (audioContextStarted) {
                 // If context already started, ensure transport is running
                 this.ensureTransportRunning();
+                return Promise.resolve(true);
             } else if (typeof Tone === 'undefined') {
                  console.error("Tone.js not available. Cannot start audio.");
                  UIManager.showError("Audio library failed to load. Please refresh.", DOMElements.joinError);
+                 return Promise.resolve(false);
             }
+
+            if (typeof Tone !== 'undefined' && Tone.context?.state === 'running') {
+                audioContextStarted = true;
+                this.ensureTransportRunning();
+                return Promise.resolve(true);
+            }
+
+            return Promise.resolve(audioContextStarted);
         },
 
         /** Ensures Tone.Transport is running if the audio context is active. */
@@ -164,23 +276,24 @@
 
         /** Creates/caches a Tone.Player, initiating loading. */
         loadPlayer: function(url) {
-            if (!url || typeof url !== 'string') {
+            const resolvedUrl = this.resolveSoundUrl(url);
+            if (!resolvedUrl) {
                 console.warn("[Audio Load] Invalid URL:", url);
                 return null;
             }
-            if (!this.audioPlayers[url]) {
-                console.log(`[Audio Load] Creating player for: ${url}`);
+            if (!this.audioPlayers[resolvedUrl]) {
+                console.log(`[Audio Load] Creating player for: ${resolvedUrl}`);
                 try {
-                    const player = new Tone.Player(url).toDestination();
-                    player.buffer.onload = () => console.log(`[Audio Load] Buffer loaded: ${url}`);
-                    player.buffer.onerror = (e) => console.error(`[Audio Load] Buffer error for ${url}:`, e);
-                    this.audioPlayers[url] = player;
+                    const player = new Tone.Player(resolvedUrl).toDestination();
+                    player.buffer.onload = () => console.log(`[Audio Load] Buffer loaded: ${resolvedUrl}`);
+                    player.buffer.onerror = (e) => console.error(`[Audio Load] Buffer error for ${resolvedUrl}:`, e);
+                    this.audioPlayers[resolvedUrl] = player;
                 } catch (e) {
-                    console.error(`[Audio Load] Error creating Tone.Player for ${url}:`, e);
+                    console.error(`[Audio Load] Error creating Tone.Player for ${resolvedUrl}:`, e);
                     return null;
                 }
             }
-            return this.audioPlayers[url];
+            return this.audioPlayers[resolvedUrl];
         },
 
         /** Initiates loading for all necessary game sounds. */
@@ -196,11 +309,12 @@
 
             Object.values(players || {}).forEach(p => {
                 if (p.uniqueAnimalSoundURL) {
-                    urlsToLoad.add(p.uniqueAnimalSoundURL);
-                    this.knownAnimalSoundURLs.push(p.uniqueAnimalSoundURL);
+                    const animalUrl = this.resolveSoundUrl(p.uniqueAnimalSoundURL);
+                    urlsToLoad.add(animalUrl);
+                    this.knownAnimalSoundURLs.push(animalUrl);
                 }
                 if (p.uniqueUnfoundSoundURL) {
-                    urlsToLoad.add(p.uniqueUnfoundSoundURL);
+                    urlsToLoad.add(this.resolveSoundUrl(p.uniqueUnfoundSoundURL));
                 }
             });
 
@@ -226,34 +340,67 @@
 
         /** Plays a sound file once using its cached Tone.Player instance. */
         play: function(url, context = 'general') {
-            if (!url) {
+            const resolvedUrl = this.resolveSoundUrl(url);
+            if (!resolvedUrl) {
                 console.warn(`[${context}] playAudio called with invalid URL.`);
                 return;
             }
             if (!audioContextStarted || typeof Tone === 'undefined') {
-                console.error(`[${context}] Cannot play ${url}: Audio context not running.`);
+                console.error(`[${context}] Cannot play ${resolvedUrl}: Audio context not running.`);
                 return;
             }
             this.ensureTransportRunning();
 
-            const player = this.audioPlayers[url];
+            const player = this.audioPlayers[resolvedUrl];
             if (player) {
                 if (player.loaded) {
                     try {
                         player.stop(Tone.now()); // Stop previous playback first
                         player.start(Tone.now());
                     } catch (e) {
-                        console.error(`[${context}] Error starting playback for ${url}:`, e);
+                        console.error(`[${context}] Error starting playback for ${resolvedUrl}:`, e);
                     }
                 } else {
-                    console.warn(`[${context}] Player ${url} exists but not loaded. Skipping.`);
+                    console.warn(`[${context}] Player ${resolvedUrl} exists but not loaded. Skipping.`);
                     // Optionally trigger loading again if needed
                     // this.loadPlayer(url);
                 }
             } else {
-                console.error(`[${context}] Player ${url} not found. Cannot play.`);
-                this.loadPlayer(url); // Attempt to load if missing
+                console.error(`[${context}] Player ${resolvedUrl} not found. Cannot play.`);
+                this.loadPlayer(resolvedUrl); // Attempt to load if missing
             }
+        },
+
+        playAssignedTestSound: async function(url) {
+            if (!url) {
+                return false;
+            }
+
+            const audioReady = await this.attemptStart();
+            if (!audioReady) {
+                return false;
+            }
+
+            const player = this.loadPlayer(url);
+            if (!player) {
+                return false;
+            }
+
+            if (!player.loaded && typeof Tone !== 'undefined' && typeof Tone.loaded === 'function') {
+                try {
+                    await player.load(this.resolveSoundUrl(url));
+                } catch (error) {
+                    console.error('[waiting-room-test] Failed while waiting for audio buffers to load:', error);
+                    return false;
+                }
+            }
+
+            if (!player.loaded) {
+                return false;
+            }
+
+            this.play(url, 'waiting-room-test');
+            return true;
         },
 
         /** Stops the looping playback of the unfound sound. */
@@ -286,7 +433,7 @@
             console.log(`[Unfound Loop] Attempting to start loop for: ${url}`);
             this.ensureTransportRunning();
 
-            const player = this.audioPlayers[url];
+            const player = this.audioPlayers[this.resolveSoundUrl(url)];
             if (player && player.loaded) {
                 const duration = player.buffer.duration;
                 if (!duration || duration <= 0) {
@@ -335,6 +482,79 @@
         }
     };
 
+    const DisplayManager = {
+        wakeLockSentinel: null,
+        isKeepAwakeEnabled: false,
+
+        getNativePlugin: function() {
+            return window.Capacitor?.Plugins?.HideNSeekDisplay || null;
+        },
+
+        setDimmed: function(isDimmed) {
+            document.body.classList.toggle('hidden-display-mode', isDimmed);
+
+            const nativePlugin = this.getNativePlugin();
+            if (nativePlugin?.setDimmed) {
+                nativePlugin.setDimmed({ enabled: isDimmed }).catch(error => {
+                    console.warn('Native dimming update failed:', error);
+                });
+            }
+        },
+
+        setKeepAwake: async function(enabled) {
+            if (this.isKeepAwakeEnabled === enabled) return;
+            this.isKeepAwakeEnabled = enabled;
+
+            const nativePlugin = this.getNativePlugin();
+            if (nativePlugin?.setKeepAwake) {
+                try {
+                    await nativePlugin.setKeepAwake({ enabled });
+                    return;
+                } catch (error) {
+                    console.warn('Native keep-awake update failed:', error);
+                }
+            }
+
+            if (!('wakeLock' in navigator)) return;
+
+            try {
+                if (enabled && !this.wakeLockSentinel) {
+                    this.wakeLockSentinel = await navigator.wakeLock.request('screen');
+                } else if (!enabled && this.wakeLockSentinel) {
+                    await this.wakeLockSentinel.release();
+                    this.wakeLockSentinel = null;
+                }
+            } catch (error) {
+                console.warn('Wake lock update failed:', error);
+            }
+        },
+
+        shouldDimForState: function(state) {
+            const myPlayer = state?.players?.[myPlayerId];
+            if (!state || !myPlayer) return false;
+
+            if (state.gameState === GAME_STATE.HIDING) return !!myPlayer.isReady;
+            if (state.gameState === GAME_STATE.SEEKING) return !myPlayer.isFound;
+            if (state.gameState === GAME_STATE.GAME_OVER && state.winner === WINNER_TYPE.HIDER) return !myPlayer.isFound;
+            return false;
+        },
+
+        shouldKeepAwakeForState: function(state) {
+            if (!state) return false;
+            return state.gameState === GAME_STATE.HIDING || state.gameState === GAME_STATE.SEEKING;
+        },
+
+        syncWithState: async function(state) {
+            this.setDimmed(this.shouldDimForState(state));
+            await this.setKeepAwake(this.shouldKeepAwakeForState(state));
+        },
+
+        reset: async function() {
+            this.setDimmed(false);
+            await this.setKeepAwake(false);
+        }
+    };
+
     // =========================================================================
     // == UI Manager
     // =========================================================================
@@ -344,6 +564,7 @@
             console.log("UIManager: Initializing and caching DOM elements.");
             // Query all views
             DOMElements.views = document.querySelectorAll('.view');
+            DOMElements.hiddenDisplayOverlay = document.getElementById('hiddenDisplayOverlay');
 
             // Cache elements for each view/component
             DOMElements.howToPlayModal = document.getElementById('howToPlayModal');
@@ -362,6 +583,8 @@
             DOMElements.hiderControls = document.getElementById('hider-controls');
             DOMElements.seekTimeLimitInput = document.getElementById('seekTimeLimit');
             DOMElements.soundPlaysInput = document.getElementById('soundPlaysInput');
+            DOMElements.browserIphoneAudioNotice = document.getElementById('browserIphoneAudioNotice');
+            DOMElements.testVolumeBtn = document.getElementById('testVolumeBtn');
             DOMElements.updateSettingsBtn = document.getElementById('updateSettingsBtn');
             DOMElements.startHidingBtn = document.getElementById('startHidingBtn');
             DOMElements.startError = document.getElementById('start-error');
@@ -501,8 +724,11 @@
             const myPlayerData = state.players[myPlayerId];
             // Use client-side PLAYER_ROLE constant
             const amIHider = myPlayerData?.role === PLAYER_ROLE.HIDER;
+            const hasAssignedSound = !!myPlayerData?.uniqueAnimalSoundURL;
 
             DOMElements.hiderControls.classList.toggle('hidden', !amIHider);
+            DOMElements.browserIphoneAudioNotice.classList.toggle('hidden', AppConfig.isNativeApp());
+            DOMElements.testVolumeBtn.disabled = !hasAssignedSound;
 
             if (amIHider) {
                 // Use client-side MIN_PLAYERS_TO_START if needed, though logic relies on length check
@@ -637,12 +863,14 @@
         handleConfirmHiddenClick: function() {
              DOMElements.confirmHiddenBtn.classList.add('hidden');
              DOMElements.hidingConfirmedText.classList.remove('hidden');
+             DisplayManager.setDimmed(true);
         },
 
         handleMarkSelfFoundClick: function() {
              DOMElements.hiddenDeviceUi.classList.add('hidden');
              DOMElements.alreadyFoundText.classList.remove('hidden');
              AudioManager.play(SOUND_URLS.FOUND, 'found'); // Play found sound locally immediately
+             DisplayManager.setDimmed(false);
         },
 
         handleMarkFoundGameOverClick: function() {
@@ -650,6 +878,7 @@
              DOMElements.markFoundGameOverBtn.classList.add('hidden');
              DOMElements.gameOverFoundText.classList.remove('hidden');
              AudioManager.play(SOUND_URLS.FAIL, 'fail'); // Play the 'fail' sound
+             DisplayManager.setDimmed(false);
         }
     };
 
@@ -660,16 +889,36 @@
         socket: null,
 
         /** Initialize Socket.IO connection and base event listeners. */
-        init: function() {
+        init: async function() {
             console.log("SocketClient: Initializing connection...");
-            // Ensure Socket.IO library is loaded
-            if (typeof io === 'undefined') {
-                 console.error("Socket.IO client library not found. Ensure it's included in the HTML.");
-                 UIManager.showError("Connection library failed to load. Please refresh.", DOMElements.joinError);
+            if (AppConfig.requiresConfiguredServerUrl()) {
+                 console.error("Native app mode requires a configured backend URL in app-config.js.");
+                 UIManager.showError("Set the Render backend URL in public/app-config.js before syncing the iPhone app.", DOMElements.joinError, 0);
                  return;
             }
-            this.socket = io();
+
+            const libraryLoaded = await this.ensureClientLibraryLoaded();
+            if (!libraryLoaded) {
+                 console.error("Socket.IO client library not found after dynamic load attempt.");
+                 UIManager.showError("Connection library failed to load. Please refresh.", DOMElements.joinError, 0);
+                 return;
+            }
+
+            const serverUrl = AppConfig.getServerUrl();
+            this.socket = serverUrl ? io(serverUrl, { transports: ['websocket', 'polling'] }) : io();
             this.setupEventListeners();
+        },
+
+        ensureClientLibraryLoaded: async function() {
+            if (typeof io !== 'undefined') return true;
+
+            try {
+                await ScriptLoader.load(AppConfig.getSocketIoScriptUrl());
+                return typeof io !== 'undefined';
+            } catch (error) {
+                console.error('Failed to load Socket.IO client library:', error);
+                return false;
+            }
         },
 
         /** Set up listeners for core Socket.IO events and custom game events. */
@@ -715,6 +964,7 @@
             } else {
                  UIManager.clearError(DOMElements.joinError); // Clear any previous errors on normal disconnect/leave
             }
+            void DisplayManager.reset();
         },
 
         handleErrorMsg: function(message) {
@@ -792,6 +1042,7 @@
                     UIManager.showView(VIEW_IDS.JOIN);
                     break;
             }
+            void DisplayManager.syncWithState(state);
         },
 
         handlePreSeekCountdown: function(value) {
@@ -899,7 +1150,7 @@
             if (isNaN(timeLimit) || timeLimit < MIN_SEEK_TIME_LIMIT_S || timeLimit > MAX_SEEK_TIME_LIMIT_S) {
                  errorMsg = `Time limit must be ${MIN_SEEK_TIME_LIMIT_S}-${MAX_SEEK_TIME_LIMIT_S}s.`;
             } else if (isNaN(soundPlays) || soundPlays < MIN_SOUND_PLAYS || soundPlays > MAX_SOUND_PLAYS) {
-                 errorMsg = `Sounds/phone must be ${MIN_SOUND_PLAYS}-${MAX_SOUND_PLAYS}.`;
+                 errorMsg = `Sounds per phone must be ${MIN_SOUND_PLAYS}-${MAX_SOUND_PLAYS}.`;
             }
 
             if (errorMsg) {
@@ -918,6 +1169,11 @@
             SocketClient.emitStartHiding();
         });
 
+        DOMElements.testVolumeBtn.addEventListener('click', async () => {
+            const soundUrl = currentRoomState?.players?.[myPlayerId]?.uniqueAnimalSoundURL;
+            await AudioManager.playAssignedTestSound(soundUrl);
+        });
+
         DOMElements.backToJoinBtn.addEventListener('click', () => {
             console.log("Back button clicked.");
             SocketClient.emitLeaveRoom(); // Tell server we are leaving
@@ -929,6 +1185,7 @@
             if (seekTimerInterval) clearInterval(seekTimerInterval); // Clear timer if running
             seekTimerInterval = null;
             AudioManager.resetState(); // Reset audio state as well
+            void DisplayManager.reset();
         });
 
         // --- Hiding Phase View ---
@@ -956,16 +1213,19 @@
     }
 
     // --- App Initialization ---
-    function initializeApp() {
+    async function initializeApp() {
         console.log("Hide 'n' Seek: Initializing application...");
         UIManager.init(); // Cache DOM elements first
-        SocketClient.init(); // Start socket connection
         setupUIEventListeners(); // Setup button clicks etc.
         UIManager.showView(VIEW_IDS.JOIN); // Start at the join view
+        await SocketClient.init(); // Start socket connection
+        void DisplayManager.reset();
         console.log("Application initialized. Waiting for server connection and user interaction.");
     }
 
     // Start the application once the DOM is fully loaded
-    document.addEventListener('DOMContentLoaded', initializeApp);
+    document.addEventListener('DOMContentLoaded', () => {
+        void initializeApp();
+    });
 
 })(); // End IIFE

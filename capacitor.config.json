@@ -1,0 +1,6 @@
+{
+  "appId": "com.himarcel99.hidenseek",
+  "appName": "Hide n Seek",
+  "webDir": "public",
+  "bundledWebRuntime": false
+}
