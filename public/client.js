@@ -147,136 +147,6 @@
         }
     };
 
-    const IOSBrowserAudioUnmute = {
-        activationEvents: ['auxclick', 'click', 'contextmenu', 'dblclick', 'keydown', 'keyup', 'mousedown', 'mouseup', 'touchend'],
-        initialized: false,
-        htmlAudioState: 'blocked',
-        webAudioState: 'blocked',
-        silentAudioFile: '',
-        htmlAudioElement: null,
-        audioContext: null,
-        audioSource: null,
-
-        getAudioContextClass: function() {
-            return window.AudioContext || window.webkitAudioContext || null;
-        },
-
-        isSupported: function() {
-            return BrowserEnvironment.isAppleMobileBrowser()
-                && typeof window !== 'undefined'
-                && !!this.getAudioContextClass();
-        },
-
-        init: function() {
-            if (this.initialized || !this.isSupported()) return;
-            this.initialized = true;
-
-            const AudioContextClass = this.getAudioContextClass();
-            const probeContext = new AudioContextClass();
-            this.silentAudioFile = this.createSilentAudioFile(probeContext.sampleRate);
-            void probeContext.close();
-
-            this.activationEvents.forEach(eventName => {
-                window.addEventListener(eventName, this.handleUserActivation, { capture: true, passive: true });
-            });
-        },
-
-        createSilentAudioFile: function(sampleRate) {
-            const arrayBuffer = new ArrayBuffer(10);
-            const dataView = new DataView(arrayBuffer);
-            dataView.setUint32(0, sampleRate, true);
-            dataView.setUint32(4, sampleRate, true);
-            dataView.setUint16(8, 1, true);
-            const missingCharacters = window.btoa(String.fromCharCode(...new Uint8Array(arrayBuffer))).slice(0, 13);
-            return `data:audio/wav;base64,UklGRisAAABXQVZFZm10IBAAAAABAAEA${missingCharacters}AgAZGF0YQcAAACAgICAgICAAAA=`;
-        },
-
-        handleUserActivation: function() {
-            const helper = IOSBrowserAudioUnmute;
-            if (!helper.isSupported()) return;
-
-            if (helper.htmlAudioState === 'blocked') {
-                helper.htmlAudioState = 'pending';
-                helper.createHtmlAudio();
-            }
-
-            if (helper.webAudioState === 'blocked') {
-                helper.webAudioState = 'pending';
-                helper.createWebAudio();
-            }
-        },
-
-        createHtmlAudio: function() {
-            const audio = document.createElement('audio');
-            audio.setAttribute('x-webkit-airplay', 'deny');
-            audio.setAttribute('playsinline', '');
-            audio.setAttribute('webkit-playsinline', '');
-            audio.preload = 'auto';
-            audio.loop = true;
-            audio.src = this.silentAudioFile;
-            audio.load();
-
-            audio.play().then(() => {
-                this.htmlAudioState = 'allowed';
-                this.htmlAudioElement = audio;
-                this.maybeCleanup();
-            }).catch(() => {
-                this.htmlAudioState = 'blocked';
-                audio.pause();
-                audio.removeAttribute('src');
-                audio.load();
-            });
-        },
-
-        createWebAudio: function() {
-            const AudioContextClass = this.getAudioContextClass();
-            if (!AudioContextClass) {
-                this.webAudioState = 'blocked';
-                return;
-            }
-
-            const context = new AudioContextClass();
-            const markAllowed = () => {
-                const source = context.createBufferSource();
-                source.buffer = context.createBuffer(1, 1, 22050);
-                source.connect(context.destination);
-                source.start();
-                this.webAudioState = 'allowed';
-                this.audioContext = context;
-                this.audioSource = source;
-                this.maybeCleanup();
-            };
-
-            const markBlocked = () => {
-                this.webAudioState = 'blocked';
-                void context.close();
-            };
-
-            if (context.state === 'running') {
-                markAllowed();
-                return;
-            }
-
-            context.resume().then(() => {
-                if (context.state === 'running') {
-                    markAllowed();
-                } else {
-                    markBlocked();
-                }
-            }).catch(() => {
-                markBlocked();
-            });
-        },
-
-        maybeCleanup: function() {
-            if (this.htmlAudioState !== 'allowed' || this.webAudioState !== 'allowed') return;
-
-            this.activationEvents.forEach(eventName => {
-                window.removeEventListener(eventName, this.handleUserActivation, { capture: true, passive: true });
-            });
-        }
-    };
-
     // =========================================================================
     // == Audio Manager (Tone.js)
     // =========================================================================
@@ -370,8 +240,6 @@
 
         /** Attempts to start the Tone.js Audio Context. MUST be called after user interaction. */
         attemptStart: function() {
-            IOSBrowserAudioUnmute.handleUserActivation();
-
             // Only attempt if Tone is available and context is not already running
             if (!audioContextStarted && typeof Tone !== 'undefined' && Tone.context && Tone.context.state !== 'running') {
                 console.log("Attempting Tone.start() due to user interaction...");
@@ -1477,7 +1345,6 @@
     async function initializeApp() {
         console.log("Hide 'n' Seek: Initializing application...");
         UIManager.init(); // Cache DOM elements first
-        IOSBrowserAudioUnmute.init();
         setupUIEventListeners(); // Setup button clicks etc.
         UIManager.showView(VIEW_IDS.JOIN); // Start at the join view
         await SocketClient.init(); // Start socket connection
